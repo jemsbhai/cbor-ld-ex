@@ -448,23 +448,28 @@ class TestPrecisionModes:
     def test_32bit_uses_floats(self):
         """32-bit mode: IEEE 754 floats, no quantization.
 
-        At 32-bit, encode_opinion_bytes should store raw float32 values.
+        At 32-bit, encode_opinion_bytes transmits 3 floats (b, d, a).
+        û is derived by the decoder from b + d + u = 1.
+        3 float32 values = 12 bytes.
         """
-        data = encode_opinion_bytes(0, 0, 0, 0, precision=32)
-        # 4 float32 values = 16 bytes
-        assert len(data) == 16
+        data = encode_opinion_bytes(0.0, 0.0, 0.5, precision=32)
+        assert len(data) == 12
 
     def test_8bit_byte_encoding_size(self):
-        """8-bit: 4 bytes (1 byte per component)."""
+        """8-bit: 3 bytes (b̂, d̂, â). û is derived, NOT transmitted.
+
+        This is the core bit-packing insight: transmitting û would waste
+        8 bits of zero information content because û = 255 - b̂ - d̂.
+        """
         b_q, d_q, u_q, a_q = quantize_binomial(0.85, 0.05, 0.10, 0.50, precision=8)
-        data = encode_opinion_bytes(b_q, d_q, u_q, a_q, precision=8)
-        assert len(data) == 4
+        data = encode_opinion_bytes(b_q, d_q, a_q, precision=8)
+        assert len(data) == 3
 
     def test_16bit_byte_encoding_size(self):
-        """16-bit: 8 bytes (2 bytes per component)."""
+        """16-bit: 6 bytes (2 bytes each for b̂, d̂, â). û is derived."""
         b_q, d_q, u_q, a_q = quantize_binomial(0.85, 0.05, 0.10, 0.50, precision=16)
-        data = encode_opinion_bytes(b_q, d_q, u_q, a_q, precision=16)
-        assert len(data) == 8
+        data = encode_opinion_bytes(b_q, d_q, a_q, precision=16)
+        assert len(data) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -472,52 +477,76 @@ class TestPrecisionModes:
 # ---------------------------------------------------------------------------
 
 class TestByteEncoding:
-    """encode_opinion_bytes / decode_opinion_bytes roundtrip."""
+    """encode_opinion_bytes / decode_opinion_bytes roundtrip.
+
+    Wire format transmits 3 values (b̂, d̂, â). The decoder derives
+    û = (2ⁿ−1) − b̂ − d̂ and returns the full 4-tuple (b̂, d̂, û, â).
+    """
 
     def test_8bit_encode_decode_roundtrip(self):
-        """Encode quantized values to bytes and decode back."""
+        """Encode 3 values, decode recovers all 4 including derived û."""
         b_q, d_q, u_q, a_q = 217, 13, 25, 128
-        data = encode_opinion_bytes(b_q, d_q, u_q, a_q, precision=8)
+        # Encode: transmit b̂, d̂, â (NOT û)
+        data = encode_opinion_bytes(b_q, d_q, a_q, precision=8)
+        assert len(data) == 3
+        # Decode: recovers full 4-tuple, deriving û
         b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=8)
-
         assert (b_r, d_r, u_r, a_r) == (217, 13, 25, 128)
 
     def test_16bit_encode_decode_roundtrip(self):
         """16-bit roundtrip."""
         b_q, d_q, u_q, a_q = quantize_binomial(0.85, 0.05, 0.10, 0.50, precision=16)
-        data = encode_opinion_bytes(b_q, d_q, u_q, a_q, precision=16)
+        data = encode_opinion_bytes(b_q, d_q, a_q, precision=16)
+        assert len(data) == 6
         b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=16)
-
         assert (b_r, d_r, u_r, a_r) == (b_q, d_q, u_q, a_q)
 
     def test_32bit_encode_decode_roundtrip(self):
-        """32-bit mode stores IEEE 754 floats directly.
+        """32-bit mode: transmits 3 IEEE 754 floats (b, d, a).
 
-        encode_opinion_bytes at precision=32 takes the ORIGINAL float
-        values (not quantized ints), packs as float32, and roundtrips.
+        Decoder derives u = 1.0 - b - d from the float values.
         """
-        # For 32-bit, we pass the raw float values (as float-ish ints or
-        # the function signature may differ — see implementation note below).
-        # The key test: pack 4 float32 values and recover them.
         b, d, u, a = 0.85, 0.05, 0.10, 0.50
-        data = encode_opinion_bytes(b, d, u, a, precision=32)
+        data = encode_opinion_bytes(b, d, a, precision=32)
+        assert len(data) == 12
         b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=32)
 
-        # float32 has ~7 decimal digits of precision
         assert abs(b_r - b) < 1e-6
         assert abs(d_r - d) < 1e-6
         assert abs(u_r - u) < 1e-6
         assert abs(a_r - a) < 1e-6
 
+    def test_decode_derives_u_correctly(self):
+        """Decoder derives û = (2ⁿ−1) − b̂ − d̂ for integer modes.
+
+        This is the information-theoretic justification: û carries zero
+        bits of new information, so transmitting it is pure waste.
+        The decoder MUST reconstruct it exactly.
+        """
+        # Vacuous opinion: b=0, d=0, u=255
+        data = encode_opinion_bytes(0, 0, 128, precision=8)
+        b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=8)
+        assert u_r == 255  # derived: 255 - 0 - 0
+
+        # Full belief: b=255, d=0, u=0
+        data = encode_opinion_bytes(255, 0, 128, precision=8)
+        b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=8)
+        assert u_r == 0  # derived: 255 - 255 - 0
+
+        # Mixed: b=200, d=30, u=25
+        data = encode_opinion_bytes(200, 30, 128, precision=8)
+        b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=8)
+        assert u_r == 25  # derived: 255 - 200 - 30
+
     @given(opinion=valid_binomial_opinion())
     @settings(max_examples=200)
     def test_8bit_roundtrip_property(self, opinion):
-        """Property: encode → decode is identity for quantized values."""
+        """Property: encode(b̂,d̂,â) → decode → (b̂,d̂,û,â) for any valid opinion."""
         b, d, u, a = opinion
         assume(u >= 0)
 
         b_q, d_q, u_q, a_q = quantize_binomial(b, d, u, a, precision=8)
-        data = encode_opinion_bytes(b_q, d_q, u_q, a_q, precision=8)
+        data = encode_opinion_bytes(b_q, d_q, a_q, precision=8)
         b_r, d_r, u_r, a_r = decode_opinion_bytes(data, precision=8)
 
         assert (b_r, d_r, u_r, a_r) == (b_q, d_q, u_q, a_q)

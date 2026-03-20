@@ -242,41 +242,66 @@ def dequantize_multinomial(
 def encode_opinion_bytes(
     b_q: Union[int, float],
     d_q: Union[int, float],
-    u_q: Union[int, float],
     a_q: Union[int, float],
     precision: int = 8,
 ) -> bytes:
-    """Serialize quantized opinion to bytes.
+    """Serialize quantized opinion to bytes — transmits 3 values only.
 
-    Precision modes (Table 1):
-      8-bit:  4 bytes — 1 byte per component (uint8)
-      16-bit: 8 bytes — 2 bytes per component (uint16, big-endian)
-      32-bit: 16 bytes — 4 IEEE 754 float32 values (big-endian)
+    The uncertainty component û is NEVER transmitted. It carries zero
+    bits of information because û = (2ⁿ−1) − b̂ − d̂ (integer modes)
+    or u = 1 − b − d (float mode). The decoder derives it.
+
+    Wire format (Table 1, revised for information-theoretic efficiency):
+      8-bit:  3 bytes — b̂(uint8), d̂(uint8), â(uint8)
+      16-bit: 6 bytes — b̂(uint16), d̂(uint16), â(uint16), big-endian
+      32-bit: 12 bytes — b(float32), d(float32), a(float32), big-endian
+
+    Args:
+        b_q: Quantized belief (or float for 32-bit mode).
+        d_q: Quantized disbelief (or float for 32-bit mode).
+        a_q: Quantized base rate (or float for 32-bit mode).
+        precision: Quantization precision (8, 16, or 32).
+
+    Returns:
+        Packed bytes (3, 6, or 12 bytes depending on precision).
     """
     _validate_precision(precision)
 
     if precision == 8:
-        return struct.pack(">BBBB", b_q, d_q, u_q, a_q)
+        return struct.pack(">BBB", b_q, d_q, a_q)
     elif precision == 16:
-        return struct.pack(">HHHH", b_q, d_q, u_q, a_q)
+        return struct.pack(">HHH", b_q, d_q, a_q)
     else:  # precision == 32
-        return struct.pack(">ffff", float(b_q), float(d_q), float(u_q), float(a_q))
+        return struct.pack(">fff", float(b_q), float(d_q), float(a_q))
 
 
 def decode_opinion_bytes(
     data: bytes, precision: int = 8
 ) -> tuple:
-    """Deserialize bytes to quantized opinion values.
+    """Deserialize bytes to quantized opinion values — derives û.
+
+    Reads 3 transmitted values (b̂, d̂, â) and derives the uncertainty
+    component: û = (2ⁿ−1) − b̂ − d̂ for integer modes, or
+    u = 1.0 − b − d for float mode.
 
     Returns:
-      8-bit / 16-bit: (b_q, d_q, u_q, a_q) as ints
-      32-bit: (b, d, u, a) as floats
+      8-bit / 16-bit: (b_q, d_q, u_q, a_q) as ints — 4 values
+      32-bit: (b, d, u, a) as floats — 4 values
+
+    The caller always receives a 4-tuple. The wire format is 3 values;
+    the 4th is reconstructed here.
     """
     _validate_precision(precision)
 
     if precision == 8:
-        return struct.unpack(">BBBB", data)
+        b_q, d_q, a_q = struct.unpack(">BBB", data)
+        u_q = _max_val(8) - b_q - d_q
+        return (b_q, d_q, u_q, a_q)
     elif precision == 16:
-        return struct.unpack(">HHHH", data)
+        b_q, d_q, a_q = struct.unpack(">HHH", data)
+        u_q = _max_val(16) - b_q - d_q
+        return (b_q, d_q, u_q, a_q)
     else:  # precision == 32
-        return struct.unpack(">ffff", data)
+        b, d, a = struct.unpack(">fff", data)
+        u = 1.0 - b - d
+        return (b, d, u, a)

@@ -70,7 +70,9 @@ def encode_annotation(ann: Annotation) -> bytes:
 
     if ann.header.has_opinion and ann.opinion is not None:
         precision = _PRECISION_MAP[ann.header.precision_mode]
-        opinion_bytes = encode_opinion_bytes(*ann.opinion, precision=precision)
+        b_q, d_q, u_q, a_q = ann.opinion
+        # Wire format: transmit (b̂, d̂, â) only. û is derived by decoder.
+        opinion_bytes = encode_opinion_bytes(b_q, d_q, a_q, precision=precision)
         return header_bytes + opinion_bytes
 
     return header_bytes

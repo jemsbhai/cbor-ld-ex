@@ -1,7 +1,7 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.1.0-draft  
-**Date:** 2026-03-12  
+**Version:** 0.2.0-draft  
+**Date:** 2026-03-20  
 **Authors:** Muntaser Syed  
 **Status:** Working Draft — Iterative Development  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
@@ -316,11 +316,13 @@ The uncertainty component `û` is **derived, never independently quantized**.
 
 **Table 1: Precision characteristics by mode.**
 
-| Precision Mode | Bits/value | Max error (b,d) | Max error (u) | Opinion tuple bytes |
+The wire format transmits **3 values only** (b̂, d̂, â). The uncertainty component û is NEVER transmitted — it carries zero bits of Shannon information because û = (2ⁿ−1) − b̂ − d̂. The decoder derives it.
+
+| Precision Mode | Bits/value | Max error (b,d) | Max error (u) | Wire bytes (3 values) |
 |---|---|---|---|---|
-| 00 (8-bit) | 8 | ≈ 0.00196 | ≈ 0.00392 | 4 |
-| 01 (16-bit) | 16 | ≈ 0.0000076 | ≈ 0.0000153 | 8 |
-| 10 (32-bit float) | 32 | IEEE 754 | IEEE 754 | 16 |
+| 00 (8-bit) | 8 | ≈ 0.00196 | ≈ 0.00392 | 3 |
+| 01 (16-bit) | 16 | ≈ 0.0000076 | ≈ 0.0000153 | 6 |
+| 10 (32-bit float) | 32 | IEEE 754 | IEEE 754 | 12 |
 | 11 (reserved) | — | — | — | — |
 
 ### 4.4 Constrained Multinomial Quantization
@@ -360,12 +362,12 @@ b̂ₖ  = (2ⁿ − 1) − (∑ᵢ₌₁ᵏ⁻¹ b̂ᵢ) − û
 [1 byte]  precision_mode (same 2-bit encoding as binomial, packed with 6 reserved bits)
 [k−1 × value_width]  b̂₁, ..., b̂ₖ₋₁ (independently quantized)
 [value_width]         û (independently quantized)
-[k × value_width]    â₁, ..., âₖ (base rate vector; â_k derived via clamping)
+[(k-1) × value_width]  â₁, ..., âₖ₋₁ (independently quantized; âₖ derived via clamping)
 ```
 
-The k-th belief component `b̂ₖ` is derived by the decoder: `b̂ₖ = (2ⁿ − 1) − (∑ᵢ₌₁ᵏ⁻¹ b̂ᵢ) − û`.
+The k-th belief component `b̂ₖ` is derived by the decoder: `b̂ₖ = (2ⁿ − 1) − (∑ᵢ₌₁ᵏ⁻¹ b̂ᵢ) − û`. Similarly, `âₖ = (2ⁿ − 1) − ∑ᵢ₌₁ᵏ⁻¹ âᵢ`. Neither derived component is transmitted.
 
-**Space cost:** For 8-bit precision and `k = 4` (quaternary domain): `1 + 1 + 3 + 1 + 4 = 10 bytes`. Compare to JSON-LD encoding of the same: ~120+ bytes. The overhead scales linearly with `k`, which is acceptable since multinomial opinions are primarily used at Tier 2/3 where bandwidth is less constrained.
+**Space cost:** For 8-bit precision and `k = 4` (quaternary domain): `1 + 1 + 3 + 1 + 3 = 9 bytes`. Compare to JSON-LD encoding of the same: ~120+ bytes. The overhead scales linearly with `k`, which is acceptable since multinomial opinions are primarily used at Tier 2/3 where bandwidth is less constrained.
 
 **Tier restriction:** Tier 1 devices with 1-byte headers SHOULD use binomial opinions only. Multinomial opinions SHOULD be used at Tier 2 and above. This is a SHOULD, not a MUST — a sufficiently capable Tier 1 device MAY transmit multinomial opinions using the Tier 2 header format.
 
@@ -434,7 +436,7 @@ Bit  Width  Field
 
 If `has_opinion = 1`: opinion payload follows per `precision_mode`.
 
-Typical Tier 1 message: **5 bytes** (1 header + 4 opinion at 8-bit).
+Typical Tier 1 message: **4 bytes** (1 header + 3 opinion at 8-bit; û not transmitted).
 Minimum Tier 1 message: **1 byte** (header only, no opinion).
 
 **Tier Class 01 — Edge (Tier 2)**
@@ -449,14 +451,13 @@ Bit  Width  Field
 6    2      precision_mode
 8    4      operator_id                (see Table 2)
 12   4      reasoning_context          (see Definition 3)
-16   6      context_version            (0–63)
-18   1      has_multinomial            (0 = binomial opinion, 1 = multinomial)
-19   1      reserved
-20   4      sub_tier_depth             (0–15)
+16   4      context_version            (0–15)
+20   1      has_multinomial            (0 = binomial opinion, 1 = multinomial)
+21   3      sub_tier_depth             (0–7)
 24   8      source_count               (0–255 contributing Tier 1 sources)
 ```
 
-**4 byte fixed header.**
+**4 byte (32-bit) fixed header.** The original draft had 36 bits (context_version: 6, sub_tier_depth: 4, plus a reserved bit). Corrected to exactly 32 bits: context_version reduced to 4 bits (0–15), sub_tier_depth to 3 bits (0–7), reserved bit removed. Full 8-bit source_count preserved as the operationally more important field.
 
 `[GAP-3]` The `operator_id` field (4 bits, 16 values) encodes which compliance operator produced this annotation. `reasoning_context` (4 bits) specifies the interpretation mapping (Definition 3).
 
@@ -558,7 +559,7 @@ CBOR-LD-ex message = standard CBOR-LD document
                    + Tag(60000) → byte string (annotation block)
 ```
 
-The annotation block is a **sibling** of the data content in the CBOR map, keyed by a reserved key (e.g., `"@annotation"` compressed to an integer via the context registry, or a dedicated CBOR map key).
+The annotation block is a **sibling** of the data content in the CBOR map, keyed by the protocol-defined integer term ID `60000` (matching the CBOR tag number). CBOR-LD maps ALL vocabulary terms to integers on the wire — string keys never appear. The string `"@annotation"` is used only in JSON-LD text representations, never on the CBOR wire. CBOR encoding cost: 3 bytes (major type 0, additional info 25, 2-byte value). Compare to `"@annotation"` as a CBOR text string: 12 bytes.
 
 ---
 
@@ -759,7 +760,7 @@ The receiver reconstructs: `b̂_new = b̂_prev + Δb̂`, `d̂_new = d̂_prev + �
 
 **Constraint:** The receiver MUST verify `b̂_new, d̂_new ≥ 0` and `b̂_new + d̂_new ≤ 2ⁿ−1`. If violated, the delta is invalid and the receiver MUST request a full opinion retransmission (via CoAP RST or application-level NACK).
 
-**Savings:** Delta encoding reduces the opinion payload from 4 bytes (full) to 2 bytes (delta) when changes are small. For a sensor reporting every 5 seconds with slowly-changing conditions, this halves the annotation bandwidth.
+**Savings:** Delta encoding reduces the opinion payload from 3 bytes (full) to 2 bytes (delta) when changes are small. For a sensor reporting every 5 seconds with slowly-changing conditions, this halves the annotation bandwidth.
 
 **Limitation:** Delta encoding requires stateful receivers (they must track the previous opinion). Stateless receivers or receivers that missed a message MUST fall back to full opinion encoding. The protocol handles this via periodic full-opinion "keyframes" — every Nth message carries the full opinion regardless of change.
 
@@ -968,12 +969,14 @@ CBOR-LD-ex does NOT define its own transport encryption. It relies on existing I
 
 ## Appendix B: Precision Mode Quick Reference
 
+The wire format transmits 3 values (b̂, d̂, â); û is derived by the decoder.
+
 ```
-Bits  Mode   Binomial tuple  Multinomial (k=4)  Use case
+Bits  Mode   Binomial wire   Multinomial (k=4)  Use case
 ────────────────────────────────────────────────────────────
- 8    00     4 bytes         10 bytes            Tier 1 default
-16    01     8 bytes         18 bytes            Tier 2 fusion
-32    10     16 bytes        34 bytes            Tier 3 / audit
+ 8    00     3 bytes         9 bytes             Tier 1 default
+16    01     6 bytes         16 bytes            Tier 2 fusion
+32    10     12 bytes        30 bytes            Tier 3 / audit
  —    11     reserved        reserved            Future use
 ```
 
@@ -1010,7 +1013,7 @@ Bits  Mode   Binomial tuple  Multinomial (k=4)  Use case
 
 Context-compressed integer keys, CBOR-encoded values. No annotation semantics — the opinion is just opaque data to a CBOR-LD parser.
 
-### C.3 CBOR-LD-ex Tier 1 representation (5 bytes annotation)
+### C.3 CBOR-LD-ex Tier 1 representation (4 bytes annotation)
 
 ```
 Byte 0 (header):
@@ -1022,17 +1025,30 @@ Byte 0 (header):
 
 Byte 1: b̂ = Q_8(0.85) = round(0.85 × 255) = 217
 Byte 2: d̂ = Q_8(0.05) = round(0.05 × 255) = 13
-Byte 3: û = 255 − 217 − 13 = 25  [Q_8⁻¹(25) = 0.098 ≈ 0.10 ✓]
-Byte 4: â = Q_8(0.50) = round(0.50 × 255) = 128
+Byte 3: â = Q_8(0.50) = round(0.50 × 255) = 128
 
-Total annotation: 5 bytes.
+û is NOT transmitted. Decoder derives: û = 255 − 217 − 13 = 25
+[Q_8⁻¹(25) = 0.098 ≈ 0.10 ✓]
+
+Total annotation: 4 bytes (1 header + 3 opinion).
 ```
 
-Wrapped in CBOR: `Tag(60000, h'00D90D1980')` — approximately 8 bytes with CBOR framing.
+Wrapped in CBOR: `Tag(60000, <4-byte annotation>)` — approximately 7 bytes with CBOR framing.
+Annotation map key: integer `60000` (3 CBOR bytes), not string `"@annotation"` (12 CBOR bytes).
 
-**Total CBOR-LD-ex message: ~38–43 bytes** (CBOR-LD data + CBOR-LD-ex annotation).
+**Total CBOR-LD-ex message: ~37–42 bytes** (CBOR-LD data + CBOR-LD-ex annotation).
 **Compared to JSON-LD: ~280 bytes.**
-**Compression ratio: ~85%.**
+**Compression ratio: ~85–87%.**
+
+**Annotation-only comparison (same semantic content):**
+
+| Encoding | Annotation size | Bit efficiency |
+|---|---|---|
+| JSON-LD text | ~148 bytes (1184 bits) | ~2.5% |
+| CBOR-LD (integer keys, best effort) | ~49 bytes (392 bits) | ~7.6% |
+| **CBOR-LD-ex (bit-packed)** | **4 bytes (32 bits)** | **93.0%** |
+
+CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~37× smaller than JSON-LD.
 
 ---
 

@@ -40,8 +40,11 @@ from cbor_ld_ex.headers import (
 class TestTier1Annotation:
     """Tier 1 annotation: header + opinion = 5 bytes (§C.3)."""
 
-    def test_full_message_5_bytes(self):
-        """Tier 1 with 8-bit opinion: 1 header + 4 opinion = 5 bytes."""
+    def test_full_message_4_bytes(self):
+        """Tier 1 with 8-bit opinion: 1 header + 3 opinion = 4 bytes.
+
+        Wire format transmits (b̂, d̂, â) only — û is derived by decoder.
+        """
         header = Tier1Header(
             compliance_status=ComplianceStatus.COMPLIANT,
             delegation_flag=False,
@@ -53,7 +56,7 @@ class TestTier1Annotation:
             opinion=(217, 13, 25, 128),  # quantized (b̂, d̂, û, â)
         )
         data = encode_annotation(ann)
-        assert len(data) == 5
+        assert len(data) == 4
 
     def test_header_only_1_byte(self):
         """Tier 1 with no opinion: 1 byte."""
@@ -113,7 +116,7 @@ class TestTier2Annotation:
     """Tier 2 annotation: 4-byte header + opinion payload."""
 
     def test_with_binomial_8bit(self):
-        """Tier 2 + binomial 8-bit: 4 header + 4 opinion = 8 bytes."""
+        """Tier 2 + binomial 8-bit: 4 header + 3 opinion = 7 bytes."""
         header = Tier2Header(
             compliance_status=ComplianceStatus.COMPLIANT,
             delegation_flag=False,
@@ -131,7 +134,7 @@ class TestTier2Annotation:
             opinion=(200, 30, 25, 128),
         )
         data = encode_annotation(ann)
-        assert len(data) == 8
+        assert len(data) == 7
 
     def test_roundtrip_tier2(self):
         """Full Tier 2 roundtrip."""
@@ -327,8 +330,8 @@ class TestAxiom1Stripping:
         ann_bytes = encode_annotation(ann)
         ann_tagged = cbor2.CBORTag(CBOR_TAG_CBORLD_EX, ann_bytes)
 
-        # Full CBOR-LD-ex message: data + annotation
-        full_message = {**data_payload, "@annotation": ann_tagged}
+        # Full CBOR-LD-ex message: data + annotation (integer term ID)
+        full_message = {**data_payload, CBOR_TAG_CBORLD_EX: ann_tagged}
         encoded_message = cbor2.dumps(full_message)
 
         # A CBOR-LD parser can decode the full message
@@ -336,7 +339,7 @@ class TestAxiom1Stripping:
         assert decoded_message[1] == "TemperatureReading"
         assert decoded_message[2] == 22.5
 
-        # Stripping: remove annotation key → valid CBOR-LD
+        # Stripping: remove annotation term ID → valid CBOR-LD
         stripped = {k: v for k, v in decoded_message.items()
-                    if k != "@annotation"}
+                    if k != CBOR_TAG_CBORLD_EX}
         assert stripped == data_payload
