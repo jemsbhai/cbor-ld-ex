@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/cbor-ld-ex.svg)](https://pypi.org/project/cbor-ld-ex/)
 
-CBOR-LD-ex extends [CBOR-LD](https://json-ld.github.io/cbor-ld-spec/) with bit-packed [Subjective Logic](https://en.wikipedia.org/wiki/Subjective_logic) primitives — compliance status, opinion tuples, operator provenance, and tiered reasoning metadata — enabling edge IoT devices to exchange semantically-rich compliance annotations at a fraction of the cost of JSON-LD.
+CBOR-LD-ex extends [CBOR-LD](https://json-ld.github.io/cbor-ld-spec/) with bit-packed [Subjective Logic](https://en.wikipedia.org/wiki/Subjective_logic) primitives — compliance status, opinion tuples, operator provenance, temporal decay, and security metadata — enabling edge IoT devices to exchange semantically-rich compliance annotations at a fraction of the cost of JSON-LD.
 
 Built on [jsonld-ex](https://pypi.org/project/jsonld-ex/) and its compliance algebra (Syed et al. 2026).
 
@@ -16,19 +16,32 @@ Built on [jsonld-ex](https://pypi.org/project/jsonld-ex/) and its compliance alg
 - **37× smaller** than JSON-LD, **>10× smaller** than standard CBOR-LD for the same semantic content
 - **93% bit efficiency** — almost every wire bit carries Shannon information
 - **Tiered encoding** adapts to device capability: 1-byte headers on MCUs, 4-byte+ on gateways/cloud
+- **Temporal extensions** — bit-packed decay metadata, log-scale half-life (1s to 388 days in 8 bits), compliance triggers
+- **Security primitives** — annotation digests, Byzantine fusion metadata, chained provenance (16 bytes per entry, zero waste)
+- **Transport-agnostic** — identical payloads over MQTT and CoAP
 - **Three formal axioms** — backward compatibility, algebraic closure, quantization correctness
-- **Constrained quantization** preserves `b + d + u = 1` exactly — û is derived, never transmitted
-- **146 tests** including exhaustive 8-bit verification (32,896 pairs) and Hypothesis property tests
+- **282 tests** including exhaustive 8-bit verification (32,896 pairs) and Hypothesis property tests
 
-## Compression Benchmark
+## 6-Way Encoding Benchmark
 
-| Encoding | Annotation size | Bit efficiency | vs JSON-LD |
-|---|---|---|---|
-| JSON-LD (verbose text) | ~148 bytes | ~2.5% | baseline |
-| CBOR-LD (integer keys, best effort) | ~49 bytes | ~7.6% | 3× |
-| **CBOR-LD-ex (bit-packed)** | **4 bytes** | **93.0%** | **37×** |
+CBOR-LD-ex is not just smaller — it carries **more semantic information** in **fewer bytes** than any alternative encoding.
 
-The key insight: the SL constraint `b + d + u = 1` means û carries zero bits of Shannon information. CBOR-LD-ex transmits only 3 values (b̂, d̂, â) and derives û on decode. Combined with bit-packed headers and integer term IDs, this achieves >10× compression over CBOR-LD for the same semantic content.
+| # | Encoding | Payload size | Annotation overhead | Semantic fields |
+|---|---|---|---|---|
+| 1 | JSON-LD (raw text) | ~280 bytes | ~148 bytes | data + verbose annotation |
+| 2 | jsonld-ex CBOR-LD (context-only compression) | ~85 bytes | 0 | data only |
+| 3 | Our CBOR-LD (full key+value compression) | ~22 bytes | 0 | data only |
+| 4 | jsonld-ex CBOR-LD + annotation | ~210 bytes | ~125 bytes | data + annotation as JSON |
+| 5 | Our CBOR-LD + standard CBOR annotation | ~70 bytes | ~49 bytes | data + CBOR k/v annotation |
+| 6 | **CBOR-LD-ex (bit-packed)** | **~30 bytes** | **4 bytes** | **data + compliance + opinion + provenance** |
+
+**Key findings:**
+- CBOR-LD-ex annotation: **4 bytes** vs CBOR-LD's **49 bytes** for the same semantic content (>10× smaller)
+- Our `ContextRegistry` (full key+value compression) beats jsonld-ex's context-only compression
+- CBOR-LD-ex is the **only** encoding that fits compliance + opinion in a single 802.15.4 frame (127 bytes)
+- Annotation bit efficiency: **93%** (Shannon information / wire bits)
+
+Run `cbor_ld_ex.transport.full_benchmark()` to reproduce these numbers for your own documents.
 
 ## Installation
 
@@ -86,6 +99,67 @@ assert recovered_doc["value"] == 22.5
 assert recovered_ann.opinion[:3] == (217, 13, 25)  # b̂, d̂, û (û derived)
 ```
 
+### Transport (MQTT / CoAP)
+
+```python
+from cbor_ld_ex.transport import (
+    to_mqtt_payload, from_mqtt_payload, derive_topic, derive_qos,
+    to_coap_payload, from_coap_payload,
+)
+
+# MQTT — same CBOR-LD-ex payload + protocol metadata
+payload = to_mqtt_payload(doc, ann, context_registry=registry)
+topic = derive_topic(doc, ann)         # "cbor-ld-ex/Observation/temp-042/compliant"
+qos = derive_qos(doc, ann)            # 2 (high confidence → exactly-once)
+
+# CoAP — identical payload, different transport
+coap_payload = to_coap_payload(doc, ann, context_registry=registry)
+assert coap_payload == payload         # Transport-agnostic encoding
+```
+
+### Temporal Decay
+
+```python
+from cbor_ld_ex.temporal import (
+    TemporalBlock, ExtensionBlock, encode_half_life, decode_half_life,
+    compute_decay_factor, apply_decay_quantized, DECAY_EXPONENTIAL,
+)
+
+# Encode a 1-hour half-life in 8 bits (log-scale, ~7% granularity)
+encoded = encode_half_life(3600.0)
+decoded = decode_half_life(encoded)  # ≈ 3600 seconds
+
+# Apply decay to a quantized opinion (dequantize → decay → re-quantize)
+factor = compute_decay_factor(DECAY_EXPONENTIAL, half_life=3600.0, elapsed=3600.0)
+# factor ≈ 0.5 (one half-life elapsed)
+b2, d2, u2, a2 = apply_decay_quantized(*ann.opinion, factor, precision=8)
+assert b2 + d2 + u2 == 255  # Axiom 3 preserved through decay
+```
+
+### Security
+
+```python
+from cbor_ld_ex.security import (
+    compute_annotation_digest, verify_annotation_digest,
+    ProvenanceEntry, CHAIN_ORIGIN_SENTINEL,
+    encode_provenance_entry, verify_provenance_chain, compute_entry_digest,
+)
+
+# Annotation digest (truncated SHA-256, 8 bytes)
+digest = compute_annotation_digest(wire_bytes)
+assert verify_annotation_digest(wire_bytes, digest)
+
+# Provenance chain entry (16 bytes, 128 bits, zero waste)
+entry = ProvenanceEntry(
+    origin_tier=0, operator_id=0, precision_mode=0,
+    b_q=217, d_q=13, a_q=128,
+    timestamp=1710230400,
+    prev_digest=CHAIN_ORIGIN_SENTINEL,
+)
+entry_bytes = encode_provenance_entry(entry)
+assert len(entry_bytes) == 16  # Every bit carries information
+```
+
 ## Architecture
 
 ```
@@ -93,11 +167,11 @@ Tier 1 (Constrained)     Tier 2 (Edge Gateway)      Tier 3 (Cloud)
 ┌─────────────────┐      ┌─────────────────────┐    ┌──────────────────────┐
 │ 1-byte header   │      │ 4-byte header        │    │ 4-byte + extensions  │
 │ 3-byte opinion  │─────>│ Fused opinion         │──>│ Provenance chain     │
-│ = 4 bytes total │      │ Operator provenance   │    │ Full audit trail     │
-│                 │      │ Source count           │    │ Byzantine metadata   │
+│ = 4 bytes total │ MQTT │ Operator provenance   │    │ Full audit trail     │
+│                 │ CoAP │ Byzantine filtering   │    │ Chained digests      │
 └─────────────────┘      └─────────────────────┘    └──────────────────────┘
-     ~85% smaller              Fusion + filtering         Full reasoning
-     than JSON-LD              at the edge                 reconstruction
+     ~85% smaller              Temporal decay             Full reasoning
+     than JSON-LD              + spatial fusion            reconstruction
 ```
 
 ## Formal Guarantees
@@ -108,7 +182,7 @@ Tier 1 (Constrained)     Tier 2 (Edge Gateway)      Tier 3 (Cloud)
 | **Axiom 2** | Algebraic Closure | Every SL operator produces valid annotations |
 | **Axiom 3** | Quantization Correctness | `b̂ + d̂ + û = 2ⁿ − 1` exactly |
 
-All three axioms are verified by cross-cutting property tests (19 tests in `test_axioms.py`) including exhaustive enumeration of all 32,896 valid 8-bit opinion pairs.
+All three axioms are verified by cross-cutting property tests including exhaustive enumeration of all 32,896 valid 8-bit opinion pairs, and Hypothesis property tests through all operators (fusion, meet, decay).
 
 | Precision | Max error (b,d) | Max error (u) | Wire bytes |
 |-----------|----------------|---------------|------------|
@@ -122,8 +196,11 @@ All three axioms are verified by cross-cutting property tests (19 tests in `test
 |--------|---------|
 | `opinions.py` | Constrained quantization codec (Theorems 1–3) |
 | `headers.py` | Tier-dependent header encoding/decoding (§5) |
-| `annotations.py` | Annotation assembly + CBOR Tag(60000) wrapping |
-| `codec.py` | Full encode/decode pipeline, `ContextRegistry`, `payload_comparison`, Shannon bit analysis |
+| `annotations.py` | Annotation assembly + CBOR Tag(60000) + extensions |
+| `temporal.py` | Bit-packed decay, log-scale half-life, expiry/review triggers |
+| `security.py` | Annotation digests, Byzantine metadata, provenance chains |
+| `codec.py` | Full encode/decode pipeline, `ContextRegistry`, Shannon bit analysis |
+| `transport.py` | MQTT + CoAP adapters, 6-way `full_benchmark()` engine |
 
 ## Development
 
@@ -145,20 +222,28 @@ cborldex/
 ├── src/cbor_ld_ex/
 │   ├── opinions.py       # Quantization codec (Theorems 1–3)
 │   ├── headers.py        # Tier-dependent header codec (§5)
-│   ├── annotations.py    # Annotation assembly + CBOR tagging (§5.3)
-│   └── codec.py          # Full codec, ContextRegistry, bit-level analysis (§11)
+│   ├── annotations.py    # Annotation assembly + CBOR tagging + extensions
+│   ├── temporal.py       # Temporal extensions — decay, triggers, BitWriter/BitReader
+│   ├── security.py       # Digests, Byzantine metadata, provenance chains
+│   ├── codec.py          # Full codec, ContextRegistry, bit-level analysis
+│   └── transport.py      # MQTT + CoAP adapters, 6-way benchmark engine
 ├── tests/
-│   ├── test_opinions.py  # 38 tests — quantization roundtrips, Hypothesis properties
-│   ├── test_headers.py   # 28 tests — Tier 1/2/3 header encoding/decoding
-│   ├── test_annotations.py  # 15 tests — assembly, CBOR tag, wire format
-│   ├── test_codec.py     # 46 tests — full pipeline, payload comparison, bit analysis
-│   └── test_axioms.py    # 19 tests — cross-cutting axiom verification
+│   ├── test_opinions.py      # 38 tests — quantization, Hypothesis properties
+│   ├── test_headers.py       # 28 tests — Tier 1/2/3 header roundtrips
+│   ├── test_annotations.py   # 15 tests — assembly, CBOR tag, wire format
+│   ├── test_temporal.py      # 65 tests — bit-packed extensions, decay, triggers
+│   ├── test_security.py      # 33 tests — digests, Byzantine, provenance chains
+│   ├── test_codec.py         # 46 tests — full pipeline, payload comparison
+│   ├── test_axioms.py        # 19 tests — cross-cutting axiom verification
+│   └── test_transport.py     # 24 tests — MQTT, CoAP, 6-way benchmark
 ├── spec/
-│   ├── FORMAL_MODEL.md   # Formal specification v0.2.0-draft
+│   ├── FORMAL_MODEL.md       # Formal specification v0.2.0-draft
 │   └── IMPLEMENTATION_PLAN.md
 ├── pyproject.toml
 └── LICENSE
 ```
+
+**282 tests total**, all passing.
 
 ## References
 
@@ -167,6 +252,7 @@ cborldex/
 - Shannon, C.E. (1948). *A Mathematical Theory of Communication.* Bell System Technical Journal.
 - Bormann, C. and Hoffman, P. (2020). [RFC 8949: CBOR.](https://www.rfc-editor.org/rfc/rfc8949) IETF.
 - Shelby, Z. et al. (2014). [RFC 7252: CoAP.](https://www.rfc-editor.org/rfc/rfc7252) IETF.
+- Selander, G. et al. (2019). [RFC 8613: OSCORE.](https://www.rfc-editor.org/rfc/rfc8613) IETF.
 - [CBOR-LD Specification](https://json-ld.github.io/cbor-ld-spec/) (W3C Community Group Draft).
 - [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) (W3C Recommendation).
 
