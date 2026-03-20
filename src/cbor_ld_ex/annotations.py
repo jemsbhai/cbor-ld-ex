@@ -5,7 +5,10 @@ Combines headers (§5) and opinion payloads (§4) into complete
 annotation blocks, and wraps them in CBOR Tag(60000) per §5.3.
 
 Wire structure:
-  [header bytes] [opinion bytes if has_opinion]
+  [header bytes][opinion bytes if has_opinion][extension bytes if present]
+
+Extensions are detected by remaining bytes after header + opinion.
+Zero cost when absent.
 
 CBOR integration (§5.3):
   Tag(60000) → byte string (annotation block)
@@ -28,6 +31,11 @@ from cbor_ld_ex.opinions import (
     encode_opinion_bytes,
     decode_opinion_bytes,
 )
+from cbor_ld_ex.temporal import (
+    ExtensionBlock,
+    encode_extensions,
+    decode_extensions,
+)
 
 CBOR_TAG_CBORLD_EX = 60000
 
@@ -41,14 +49,20 @@ _PRECISION_MAP = {
 
 @dataclass
 class Annotation:
-    """An assembled annotation: header + optional opinion payload.
+    """An assembled annotation: header + optional opinion payload + extensions.
 
     Corresponds to Definition 6 (Annotation algebraic type) at the
-    wire level. Higher-level variants (temporal, provenance chain)
-    will be added in later phases.
+    wire level.
+
+    Wire structure:
+      [header bytes][opinion bytes if has_opinion][extension bytes if present]
+
+    Extensions are detected by remaining bytes in the annotation byte
+    string after header + opinion. Zero cost when absent.
     """
     header: Tier1Header | Tier2Header | Tier3Header
     opinion: Optional[tuple] = None  # quantized opinion (b̂, d̂, û, â)
+    extensions: Optional[ExtensionBlock] = None
 
 
 def _header_size(header: Tier1Header | Tier2Header | Tier3Header) -> int:
@@ -61,28 +75,48 @@ def _header_size(header: Tier1Header | Tier2Header | Tier3Header) -> int:
 
 
 def encode_annotation(ann: Annotation) -> bytes:
-    """Encode an annotation to bytes: header + opinion payload.
+    """Encode an annotation to bytes: header + opinion + extensions.
 
     If the header's has_opinion flag is True, the opinion tuple is
     serialized after the header bytes using the header's precision_mode.
+
+    If extensions are present, the bit-packed extension block is
+    appended after the opinion bytes. Extensions are detected on
+    decode by remaining bytes — zero overhead when absent.
     """
     header_bytes = encode_header(ann.header)
 
+    opinion_bytes = b""
     if ann.header.has_opinion and ann.opinion is not None:
         precision = _PRECISION_MAP[ann.header.precision_mode]
         b_q, d_q, u_q, a_q = ann.opinion
         # Wire format: transmit (b̂, d̂, â) only. û is derived by decoder.
         opinion_bytes = encode_opinion_bytes(b_q, d_q, a_q, precision=precision)
-        return header_bytes + opinion_bytes
 
-    return header_bytes
+    extension_bytes = b""
+    if ann.extensions is not None:
+        extension_bytes = encode_extensions(ann.extensions)
+
+    return header_bytes + opinion_bytes + extension_bytes
+
+
+def _opinion_wire_size(precision_mode: PrecisionMode) -> int:
+    """Return the wire size of an opinion payload in bytes.
+
+    3 values transmitted (b̂, d̂, â); û derived by decoder.
+    """
+    precision = _PRECISION_MAP[precision_mode]
+    if precision == 32:
+        return 12  # 3 × float32
+    return 3 * (precision // 8)  # 3 × n-bit integers
 
 
 def decode_annotation(data: bytes) -> Annotation:
     """Decode bytes into an Annotation.
 
     Reads the header (dispatching on origin_tier), then reads the
-    opinion payload if has_opinion is set.
+    opinion payload if has_opinion is set, then checks for remaining
+    bytes which indicate a bit-packed extension block.
     """
     # Decode header — this handles tier dispatch internally
     header = decode_header(data)
@@ -91,10 +125,17 @@ def decode_annotation(data: bytes) -> Annotation:
     opinion = None
     if header.has_opinion:
         precision = _PRECISION_MAP[header.precision_mode]
-        opinion_data = data[offset:]
+        opinion_size = _opinion_wire_size(header.precision_mode)
+        opinion_data = data[offset:offset + opinion_size]
         opinion = decode_opinion_bytes(opinion_data, precision=precision)
+        offset += opinion_size
 
-    return Annotation(header=header, opinion=opinion)
+    # Extensions: detected by remaining bytes after header + opinion
+    extensions = None
+    if offset < len(data):
+        extensions = decode_extensions(data[offset:])
+
+    return Annotation(header=header, opinion=opinion, extensions=extensions)
 
 
 def wrap_cbor_tag(annotation_bytes: bytes) -> bytes:
