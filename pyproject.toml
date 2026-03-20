@@ -1,0 +1,49 @@
+[tool.poetry]
+name = "cbor-ld-ex"
+version = "0.1.0"
+description = "Compact Binary Linked Data with Semantic Reasoning for Constrained IoT Networks"
+authors = ["Muntaser Syed <jemsbhai@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "cbor_ld_ex", from = "src"}]
+keywords = ["cbor", "linked-data", "iot", "subjective-logic", "compliance", "json-ld", "semantic-web"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[tool.poetry.urls]
+"Bug Tracker" = "https://github.com/jemsbhai/cbor-ld-ex/issues"
+"Documentation" = "https://github.com/jemsbhai/cbor-ld-ex"
+"Source" = "https://github.com/jemsbhai/cbor-ld-ex"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+cbor2 = ">=5.6.0"
+jsonld-ex = ">=0.7.0"
+
+[tool.poetry.group.transport.dependencies]
+aiocoap = ">=0.4.7"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-cov = ">=5.0"
+hypothesis = ">=6.100"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
