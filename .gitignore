@@ -38,3 +38,6 @@ Thumbs.db
 
 # Internal session files
 spec/SESSION_LOG.md
+
+# Local improvement plans (not for public repo)
+improvements/
