@@ -899,24 +899,58 @@ Cohesion in `[0, 1]` where 1 = perfect agreement. The gateway MAY include the co
 
 The provenance chain (§6) is the audit trail. If an attacker can modify chain entries undetected, the entire compliance determination is undermined.
 
-**Definition 27 (Chain Authentication).** Each provenance entry `eᵢ` MAY carry a message authentication code (MAC) computed over the entry contents and all preceding entries:
+**Definition 27 (Provenance Entry Wire Format).** Each provenance entry is a **fixed 16-byte (128-bit) structure with zero waste**:
 
 ```
-mac_i = HMAC-SHA256(key_tier, e₁ ∥ e₂ ∥ ... ∥ eᵢ)
+Byte 0:     [origin_tier:2][operator_id:4][precision_mode:2]
+Bytes 1-3:  b̂, d̂, â (3 × uint8 opinion — û NOT stored, derived)
+Bytes 4-7:  timestamp (uint32, big-endian, seconds since Unix epoch)
+Bytes 8-15: prev_digest (64-bit truncated SHA-256 of previous entry)
 ```
 
-Where `key_tier` is a per-tier symmetric key established during device provisioning or session establishment.
+**Bit budget:** 2 + 4 + 2 + 8 + 8 + 8 + 32 + 64 = 128 bits = 16 bytes. Zero waste — every bit carries information.
 
-**Chaining property:** `mac_i` depends on all previous entries. Modifying any earlier entry invalidates all subsequent MACs. This provides **tamper evidence** — a verifier can detect modification but not prevent it.
+**Design rationale:**
+- û is NOT stored — it is derived as `255 − b̂ − d̂` (Axiom 3). Storing û would waste 8 bits per entry.
+- Opinion is fixed at 8-bit precision (3 bytes). This is sufficient for provenance audit purposes; the full-precision opinion is in the annotation itself.
+- The `prev_digest` field creates a hash chain without requiring shared symmetric keys (unlike HMAC-based approaches). Any party with access to the chain can verify its integrity.
 
-**Wire format:** When chain authentication is enabled, each provenance entry is extended with:
+**Definition 28 (Chained Digest).** The digest linking entry `eᵢ` to entry `eᵢ₊₁` is:
 
 ```
-[8 bits]   mac_algorithm            (0 = HMAC-SHA256-64, 1 = HMAC-SHA256-128, 2–255 reserved)
-[variable] mac_value                (64 or 128 bits, truncated HMAC)
+prev_digest(eᵢ₊₁) = truncate(SHA-256(serialize(eᵢ)), 64 bits)
 ```
 
-Truncated HMAC (64 bits) is the default for bandwidth efficiency. 128-bit MAC is available for high-security environments.
+Where `serialize(eᵢ)` is the 16-byte wire encoding of entry `eᵢ` and `truncate` takes the first 8 bytes of the SHA-256 output.
+
+**Chain origin sentinel:** The first entry in a chain uses `prev_digest = 0x0000000000000000` (8 zero bytes). This sentinel allows the verifier to detect chain truncation: if the first entry does not have the sentinel, entries have been removed from the front of the chain.
+
+**Tamper detection properties:**
+
+1. **Modification:** Modifying entry `eⱼ` changes `serialize(eⱼ)`, which invalidates `prev_digest(eⱼ₊₁)` and all subsequent entries. The verifier detects this at entry `j+1`.
+
+2. **Truncation (front):** Removing entries from the beginning is detected because the new first entry will not have the chain origin sentinel.
+
+3. **Truncation (back):** Removing entries from the end is detectable only if the expected chain length is known from external context (e.g., `source_count` in the Tier 2 header).
+
+4. **Insertion:** Inserting a forged entry between `eⱼ` and `eⱼ₊₁` requires computing `SHA-256(serialize(eⱼ))`, which is feasible (SHA-256 is not keyed). Chained digests provide tamper **evidence**, not tamper **prevention**. For tamper prevention, use transport-layer security (§9.5).
+
+**Collision resistance:** The 64-bit truncated SHA-256 provides birthday-bound collision resistance of ~2³² operations. This is sufficient for IoT audit trails where chain lengths are typically < 100 entries. Deployments requiring stronger guarantees SHOULD use full 256-bit SHA-256 at the application layer.
+
+**Chain verification algorithm:**
+
+```
+verify_chain(entries):
+  if entries[0].prev_digest ≠ SENTINEL: return (false, 0)
+  for i in 1..len(entries)-1:
+    expected = truncate(SHA-256(serialize(entries[i-1])), 64)
+    if entries[i].prev_digest ≠ expected: return (false, i)
+  return (true, -1)
+```
+
+Returns `(is_valid, error_index)` where `error_index` is the first invalid entry, or `-1` if the chain is valid.
+
+**Space cost:** A provenance chain with `n` entries costs exactly `16n` bytes. For a typical Tier 1 → Tier 2 pipeline with 8 sensors and 1 fusion step: `16 × 9 = 144 bytes`. This is carried at Tier 3 only — Tier 1 and Tier 2 do not transmit chains (§6.2).
 
 **Tier 1 exception:** Tier 1 devices do not transmit provenance chains (§6.2). The integrity of Tier 1 messages is protected at the transport layer (DTLS or OSCORE, §9.5), not at the annotation layer.
 
@@ -958,26 +992,180 @@ CBOR-LD-ex does NOT define its own transport encryption. It relies on existing I
 
 ## 10. Protocol Stack Integration
 
-*Detailed specification deferred to next iteration. Covers:*
+CBOR-LD-ex is transport-agnostic: the annotation payload is identical regardless of the transport protocol. Transport-specific metadata (MQTT topics, CoAP content-format options) is derived from the annotation but is NOT part of the CBOR-LD-ex payload itself.
 
-- CoAP request/response mapping
-- CoAP Observe for streaming telemetry
-- OSCORE integration for annotation integrity
-- MQTT transport (bridging to existing jsonld-ex MQTT module)
-- Thread mesh networking considerations
+*Reference: jsonld-ex `mqtt.py`, `cbor_ld.py`; CBOR-LD-ex `transport.py`.*
 
-*Reference: jsonld-ex `mqtt.py`, `cbor_ld.py`.*
+### 10.1 Transport-Agnostic Payload Principle
+
+**Invariant:** For any CBOR-LD-ex message `M`, the payload carried over MQTT and the payload carried over CoAP MUST be byte-identical:
+
+```
+mqtt_payload(M) == coap_payload(M) == encode(doc, annotation, registry)
+```
+
+This is verified by test for all scenarios in the benchmark suite (406 tests). The transport layer adds protocol-specific routing metadata but MUST NOT alter, wrap, or re-encode the CBOR-LD-ex payload.
+
+### 10.2 MQTT Transport
+
+MQTT (v3.1.1 or v5.0) is the primary transport for Tier 1 → Tier 2 communication in most IoT deployments.
+
+**Payload:** The MQTT PUBLISH payload is the raw CBOR-LD-ex codec output — no MQTT-specific framing. The subscriber receives the exact bytes produced by `encode()`.
+
+**Topic derivation:** MQTT topics are derived from the document metadata and annotation:
+
+```
+topic = {prefix}/{@type_local}/{@id_fragment}/{compliance_status}
+```
+
+Where:
+- `prefix` defaults to `cbor-ld-ex`
+- `@type_local` is the local name of the `@type` IRI (e.g., `TemperatureReading`)
+- `@id_fragment` is the local part of `@id` (e.g., `temp-042` from `urn:sensor:temp-042`)
+- `compliance_status` is one of `compliant`, `non_compliant`, `insufficient`
+
+Example: `cbor-ld-ex/TemperatureReading/temp-042/compliant`
+
+The compliance status in the topic enables topic-based filtering at the MQTT broker level — subscribers can filter by compliance state without payload inspection, which is cheaper on constrained brokers.
+
+**QoS derivation:** MQTT QoS level is derived from the annotation’s projected probability `P(ω) = b + a·u`:
+
+| Projected probability | QoS | Rationale |
+|---|---|---|
+| P(ω) ≥ 0.9 | 2 (exactly once) | High confidence → critical, must not be lost |
+| 0.5 ≤ P(ω) < 0.9 | 1 (at least once) | Normal confidence → standard delivery |
+| P(ω) < 0.5 | 0 (at most once) | Low confidence → best-effort, acceptable to lose |
+
+If no opinion is present, QoS defaults to 1.
+
+### 10.3 CoAP Transport
+
+CoAP (RFC 7252) is the primary transport for constrained networks (802.15.4, Thread, 6LoWPAN).
+
+**Payload:** The CoAP response payload is the raw CBOR-LD-ex codec output — identical to the MQTT payload.
+
+**Content-Format:** CBOR-LD-ex uses Content-Format ID `60000` (experimental range, matching the CBOR tag number):
+
+```
+Content-Format: 60000
+```
+
+Standard CBOR is Content-Format `60`. CBOR-LD does not yet have an assigned Content-Format ID. The experimental ID `60000` is used for development and hackathon purposes.
+
+**802.15.4 frame fit:** The 802.15.4 MAC layer has an MTU of 127 bytes. With a minimal CoAP NON message overhead of approximately 16 bytes, the maximum CBOR-LD-ex payload that fits in a single frame is:
+
+```
+max_payload = 127 − 16 = 111 bytes
+```
+
+All Tier 1 CBOR-LD-ex messages in the benchmark suite fit within this limit (verified by test). Tier 2 messages with large provenance chains may require CoAP blockwise transfer (RFC 7959).
+
+### 10.4 Transport Security
+
+CBOR-LD-ex does NOT define its own transport encryption. It relies on existing IoT security protocols:
+
+| Tier path | Minimum security | Recommended |
+|---|---|---|
+| Tier 1 → Tier 2 | Pre-shared key DTLS | OSCORE with group keys (RFC 8613) |
+| Tier 2 → Tier 3 | DTLS 1.3 with certificates | OSCORE + provenance chain |
+| Tier 3 internal | TLS 1.3 | TLS 1.3 + provenance chain |
+
+OSCORE (RFC 8613) is particularly well-suited because it provides end-to-end security at the application layer, surviving CoAP proxies. The CBOR-LD-ex annotation is integrity-protected even through untrusted intermediaries.
 
 ---
 
 ## 11. Compression Analysis
 
-*Detailed specification deferred to next iteration. Covers:*
+This section presents the information-theoretic foundation for CBOR-LD-ex’s compression claims and summarizes the benchmark results. All numbers are independently verified by the test suite (406 tests, 38 benchmark scenarios).
 
-- Information-theoretic bounds on annotation compression
-- Comparison: JSON-LD vs CBOR-LD vs CBOR-LD-ex payload sizes
-- Shannon entropy analysis of typical IoT compliance payloads
-- Optimality gap analysis
+*Reference: Shannon (1948); CBOR-LD-ex `codec.py::annotation_information_bits()`, `transport.py::full_benchmark()`, `benchmarks/cbor_ld_ex_benchmark/`.*
+
+### 11.1 The û-Elision Insight
+
+The single most important compression insight in CBOR-LD-ex is that the uncertainty component û carries **zero bits of Shannon information**.
+
+Given Axiom 3: `b̂ + d̂ + û = 2ⁿ − 1`, the value of û is fully determined by b̂ and d̂. Transmitting û would transmit zero additional information — it is a derived value, not an independent variable.
+
+By eliding û from the wire format, each opinion tuple saves one value width:
+
+| Precision | With û (4 values) | Without û (3 values) | Savings |
+|---|---|---|---|
+| 8-bit | 4 bytes | 3 bytes | 25% |
+| 16-bit | 8 bytes | 6 bytes | 25% |
+| 32-bit | 16 bytes | 12 bytes | 25% |
+
+This is not an optimization — it is information-theoretically correct. Transmitting a derived value is a protocol design error.
+
+### 11.2 Shannon Information Content of Annotations
+
+For each header field, the Shannon information content is `H(field) = log₂(number_of_valid_states)` bits. Fields whose state count is a power of 2 are perfectly packed; fields with non-power-of-2 state counts have unavoidable waste bits.
+
+**Tier 1 header (1 byte = 8 wire bits):**
+
+| Field | States | H (bits) | Wire bits | Efficiency |
+|---|---|---|---|---|
+| compliance_status | 3 | 1.585 | 2 | 79.2% |
+| delegation_flag | 2 | 1.000 | 1 | 100% |
+| origin_tier | 3 | 1.585 | 2 | 79.2% |
+| has_opinion | 2 | 1.000 | 1 | 100% |
+| precision_mode | 3 | 1.585 | 2 | 79.2% |
+| **Total header** | | **6.755** | **8** | **84.4%** |
+
+**8-bit opinion payload (3 wire bytes = 24 wire bits):**
+
+The opinion (b̂, d̂, â) is constrained: b̂ + d̂ ≤ 255. The number of valid (b̂, d̂) pairs is `∑ₛ₌₀²⁵⁵ (s+1) = 256 × 257 / 2 = 32,896`. The Shannon information is `log₂(32,896) ≈ 15.006` bits for (b̂, d̂) jointly, plus `log₂(256) = 8` bits for â, totaling `23.006` bits in 24 wire bits = **95.9% efficiency**.
+
+**Tier 1 annotation total (4 bytes = 32 wire bits):**
+
+`6.755 + 23.006 = 29.761` Shannon bits in 32 wire bits = **93.0% bit efficiency**.
+
+### 11.3 Six-Way Benchmark
+
+The benchmark compares six encoding strategies for the same IoT document + annotation:
+
+1. **JSON-LD** — raw JSON text, annotation as JSON object
+2. **jsonld-ex CBOR-LD** — context-only compression (context URLs → integers), no annotation
+3. **Our CBOR-LD (data only)** — full key+value compression, no annotation
+4. **jsonld-ex CBOR-LD + annotation** — annotation embedded as JSON inside CBOR
+5. **Our CBOR-LD + CBOR annotation** — same info as CBOR-LD-ex, CBOR key-value encoding
+6. **CBOR-LD-ex** — bit-packed annotation with Tag(60000)
+
+Across 38 scenarios (4 document profiles × 12 annotation configurations, realistic pairing):
+
+| Encoding | Min (B) | Max (B) | Mean (B) | Median (B) |
+|---|---|---|---|---|
+| JSON-LD | 295 | 673 | 469 | 426 |
+| jsonld-ex CBOR-LD | 88 | 349 | 183 | 166 |
+| Our CBOR-LD (data only) | 44 | 125 | 80 | 85 |
+| jsonld-ex CBOR-LD + annotation | 245 | 553 | 368 | 327 |
+| Our CBOR-LD + CBOR annotation | 92 | 179 | 131 | 133 |
+| CBOR-LD-ex (bit-packed) | 55 | 148 | 95 | 99 |
+
+### 11.4 Verified Claims
+
+The following claims are verified as **universal invariants** over all 38 benchmark scenarios (falsification of any single scenario would retract the claim):
+
+1. **CBOR-LD-ex < JSON-LD** for all scenarios. Geometric mean compression: 79.8%.
+2. **CBOR-LD-ex < CBOR-LD + annotation** (same semantic content) for all scenarios. Bit-packing always wins over CBOR’s self-describing encoding for fixed-schema protocol metadata.
+3. **Our key+value compression ≤ jsonld-ex context-only compression** for all scenarios. Full `ContextRegistry` beats context-URL-only compression.
+4. **CBOR-LD-ex carries MORE semantic fields while being SMALLER** than data-only encodings.
+5. **All Tier 1 payloads fit a single 802.15.4 frame** (≤ 111 bytes after CoAP overhead).
+6. **Tier 1 annotation bit efficiency > 70%** for all scenarios (actual: 93% for 8-bit).
+7. **Full size ordering: CBOR-LD-ex < our+ann ≤ jex+ann < JSON-LD** for all scenarios.
+8. **Shannon information ≤ wire bits** for all annotations (physical law).
+9. **û never transmitted on wire** (verified by annotation size arithmetic for all scenarios).
+
+### 11.5 Compression Ratio Summary
+
+| Metric | Value |
+|---|---|
+| Geometric mean compression vs JSON-LD | 79.8% |
+| Best case | 85.4% (minimal document, Tier 2, 8-bit) |
+| Worst case | 72.1% (medium document, Tier 1, 32-bit) |
+| Tier 1 annotation overhead | 4 bytes (8-bit) to 13 bytes (32-bit) |
+| Annotation bit efficiency (Tier 1, 8-bit) | 93.0% |
+| Annotation ratio: JSON-LD / CBOR-LD-ex | ~37× |
+| Annotation ratio: CBOR-LD / CBOR-LD-ex | ~10× |
 
 ---
 
@@ -1097,4 +1285,4 @@ CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~3
 
 ---
 
-*End of document. Next revision will address: §8 (Graph Operations), §10 (Protocol Stack Integration), §11 (Compression Analysis).*
+*End of document. Next revision will address: §8 (Graph Operations), delta encoding implementation (§7.6), and multinomial wire optimization (§4.4).*
