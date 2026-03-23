@@ -1,7 +1,7 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.2.0-draft  
-**Date:** 2026-03-20  
+**Version:** 0.3.0-draft  
+**Date:** 2026-03-23  
 **Authors:** Muntaser Syed  
 **Status:** Working Draft — Iterative Development  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
@@ -674,41 +674,72 @@ Step 2: ω_fused = cumulative_fuse(ω'₁, ..., ω'ₙ)
 
 ### 7.4 Temporal Annotation Wire Format
 
-The temporal annotation `τ(w, λ, triggers)` from Definition 6 is encoded as an optional extension block in Tier 2/3 headers.
+The temporal annotation `τ(w, λ, triggers)` from Definition 6 is encoded as a **bit-packed extension block** appended after `[header][opinion]` in the annotation byte string. The extension block is NOT a separate CBOR structure — it occupies the remaining bytes of the annotation payload.
 
-**Tier 1 temporal encoding (minimal):**
+**Detection mechanism:** Extensions are detected by **remaining bytes** after the header and opinion have been parsed. The header size is fixed per tier (1 byte Tier 1, 4 bytes Tier 2/3) and the opinion size is deterministic from `precision_mode` (3/6/12 bytes for 8/16/32-bit). If `len(annotation_bytes) > header_size + opinion_size`, the remaining bytes are an extension block. This design achieves **zero overhead when extensions are absent** — no flags byte is needed.
 
-Tier 1 devices do not encode temporal metadata in the annotation header. Timestamps are carried in the CBOR-LD data payload (e.g., as `observedAt` fields) and are available to the receiving gateway for temporal fusion. This is a deliberate design choice: every byte of header on a constrained device is a byte not available for sensor data.
+**Bit-packed layout (MSB-first):**
 
-**Tier 2 temporal extension block:**
+The extension block is written using a BitWriter that packs fields at the bit level, padding to a byte boundary at the end with zero bits.
 
 ```
 Bit  Width  Field
 ───────────────────────────
-0    2      decay_function_id          (Table 3)
-2    1      has_half_life              (0 = use session default, 1 = explicit)
-3    1      has_temporal_window        (0 = no window, 1 = window follows)
-4    1      has_triggers               (0 = no triggers, 1 = trigger block follows)
-5    3      reserved
+0    1      has_temporal            (0 = no temporal metadata, 1 = temporal follows)
+1    1      has_triggers            (0 = no triggers, 1 = triggers follow)
 
-If has_half_life = 1:
-  [16 bits] half_life_seconds          (0–65535 seconds ≈ 18.2 hours)
+IF has_temporal = 1:
+  2    2      decay_function_id    (Table 3: 00=exponential, 01=linear, 10=step)
+  4    8      half_life_encoded    (log-scale, see below)
 
-If has_temporal_window = 1:
-  [32 bits] window_start               (seconds since epoch, truncated)
-  [16 bits] window_duration_seconds    (0–65535 seconds)
-
-If has_triggers = 1:
-  [8 bits]  trigger_count              (1–255)
+IF has_triggers = 1:
+  N    3      trigger_count        (1–7 triggers; 0 reserved)
   For each trigger:
-    [2 bits]  trigger_type             (Table 4)
-    [6 bits]  reserved/flags
-    [32 bits] trigger_time             (seconds since epoch, truncated)
-    [8 bits]  trigger_parameter        (γ for expiry, acceleration factor for review)
+    N    2      trigger_type       (Table 4)
+    IF trigger_type ∈ {expiry, review_due}:
+      N    8    trigger_parameter  (Q8 payload: γ for expiry, acceleration for review)
+    IF trigger_type ∈ {reg_change, withdrawal}:
+      (no payload — 0 bits)
+
+Pad to byte boundary with zero bits.
 ```
 
-**Minimum temporal overhead at Tier 2:** 1 byte (header only, using session defaults).
-**Typical with half-life and window:** 1 + 2 + 6 = 9 bytes.
+**Log-scale half-life encoding (8 bits, Definition 22).**
+
+The half-life parameter `τ` is encoded using a logarithmic scale:
+
+```
+seconds = 2^(value × 25 / 255)
+```
+
+This maps the 8-bit value `[0, 255]` to a range of approximately 1 second to 388 days, with each quantization step representing approximately 7% change — perceptually uniform on a log scale. Shannon efficiency is 100% (`log₂(256) / 8 = 1.0`): every bit carries one bit of information.
+
+| Encoded value | Half-life | Use case |
+|---|---|---|
+| 0 | ~1 second | Real-time sensor freshness |
+| 50 | ~53 seconds | Sub-minute IoT polling |
+| 122 | ~1 hour | Standard gateway aggregation |
+| 184 | ~1 day | Daily compliance reporting |
+| 255 | ~388 days | Long-term regulatory retention |
+
+The encoder computes: `value = round(log₂(seconds) × 255 / 25)`, clamped to `[0, 255]`.
+
+**Tier 1 temporal encoding (minimal):**
+
+Tier 1 devices do not encode temporal metadata in the annotation header. Timestamps are carried in the CBOR-LD data payload (e.g., as `observedAt` fields) and are available to the receiving gateway for temporal fusion. This is a deliberate design choice: every byte of header on a constrained device is a byte not available for sensor data. However, Tier 1 annotations MAY carry extension blocks — extensions are tier-independent since they are detected by remaining bytes.
+
+**Extension block size examples:**
+
+| Configuration | Bits | Bytes (padded) |
+|---|---|---|
+| Temporal only (no triggers) | 2 + 2 + 8 = 12 | 2 |
+| Temporal + 1 expiry trigger | 12 + 3 + 2 + 8 = 25 | 4 |
+| Temporal + 2 triggers (expiry + withdrawal) | 12 + 3 + (2+8) + (2+0) = 27 | 4 |
+| Triggers only (no temporal) | 2 + 3 + trigger_bits | varies |
+| No extensions | 0 | 0 |
+
+**Minimum temporal overhead:** 2 bytes (temporal metadata, no triggers).
+**Zero cost when absent:** 0 bytes — the annotation byte string simply ends after the opinion.
 
 ### 7.5 Compliance Trigger Types
 
@@ -716,12 +747,12 @@ Three discrete trigger types cause state changes that continuous decay cannot mo
 
 **Table 4: Trigger type identifiers (2-bit field).**
 
-| Code | Trigger | Semantic | Effect on opinion |
-|---|---|---|---|
-| 00 | expiry | Hard/soft deadline (Art. 5(1)(e)) | Transfers `b → d` by factor `(1−γ)` |
-| 01 | review_due | Missed mandatory review (Art. 35(11), 45(3)) | Accelerates decay rate (`λ → λ_fast`) |
-| 10 | regulatory_change | Legal framework change | Replaces opinion with `ω_new` |
-| 11 | reserved | — | — |
+| Code | Trigger | Semantic | Wire payload | Effect on opinion |
+|---|---|---|---|---|
+| 00 | expiry | Hard/soft deadline (Art. 5(1)(e)) | 8 bits (γ Q8) | Transfers `b → d` by factor `(1−γ)` |
+| 01 | review_due | Missed mandatory review (Art. 35(11), 45(3)) | 8 bits (accel. Q8) | Accelerates decay rate |
+| 10 | regulatory_change | Legal framework change | 0 bits | Signals opinion replacement |
+| 11 | withdrawal | Consent withdrawal (Art. 7(3)) | 0 bits | Signals full opinion invalidation |
 
 **Definition 19 (Expiry Trigger).** At trigger time `t_T`, with residual factor `γ ∈ [0,1]` (encoded as 8-bit quantized):
 
