@@ -41,3 +41,6 @@ spec/SESSION_LOG.md
 
 # Local improvement plans (not for public repo)
 improvements/
+
+# Generated benchmark output
+demo/output/
