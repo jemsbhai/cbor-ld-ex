@@ -26,6 +26,8 @@ from cbor_ld_ex.opinions import (
     dequantize_multinomial,
     encode_opinion_bytes,
     decode_opinion_bytes,
+    encode_multinomial_bytes,
+    decode_multinomial_bytes,
 )
 
 
@@ -597,3 +599,357 @@ class TestInputValidation:
         """beliefs and base_rates must have the same length."""
         with pytest.raises(ValueError):
             quantize_multinomial([0.5, 0.3], 0.2, [0.5, 0.25, 0.25], precision=8)
+
+
+# ---------------------------------------------------------------------------
+# 10. Multinomial wire encoding — bit-packed, maximum efficiency
+#
+# Wire format (bit-packed via BitWriter, MSB-first):
+#   [4 bits]  k (domain cardinality, 1-15; 0 reserved)
+#   [n × (k-1)]  b̂₁..b̂_{k-1} (independently quantized)
+#   [n × 1]      û (independently quantized)
+#   [n × (k-1)]  â₁..â_{k-1} (independently quantized)
+#   Pad to byte boundary with zero bits.
+#
+# NOT transmitted (derived by decoder):
+#   b̂_k = (2ⁿ−1) − sum(b̂₁..b̂_{k-1}) − û
+#   â_k = (2ⁿ−1) − sum(â₁..â_{k-1})
+#
+# precision_mode is NOT in the payload — it's already in the header.
+# This eliminates the 6 wasted bits from the old spec format.
+# ---------------------------------------------------------------------------
+
+
+def _expected_multinomial_wire_bits(k: int, precision: int) -> int:
+    """Compute expected wire bits for a multinomial opinion.
+
+    4 bits for k + n*(k-1) for beliefs + n for û + n*(k-1) for base rates.
+    Total = 4 + n*(2k-1).
+    """
+    return 4 + precision * (2 * k - 1)
+
+
+def _expected_multinomial_wire_bytes(k: int, precision: int) -> int:
+    """Compute expected wire bytes (padded to byte boundary)."""
+    bits = _expected_multinomial_wire_bits(k, precision)
+    return (bits + 7) // 8
+
+
+class TestMultinomialWireEncoding:
+    """Bit-packed multinomial wire encoding/decoding.
+
+    Maximum efficiency: every wire bit carries information.
+    No redundant precision_mode byte. No wasted reserved bits.
+    b̂_k and â_k are NOT transmitted — derived by decoder.
+    """
+
+    # --- Wire size tests ---
+
+    def test_wire_size_k4_8bit(self):
+        """k=4, 8-bit: 4 + 8×7 = 60 bits = 8 bytes."""
+        beliefs_q, u_q, br_q = quantize_multinomial(
+            [0.6, 0.2, 0.1, 0.0], 0.1, [0.25, 0.25, 0.25, 0.25], precision=8
+        )
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        assert len(data) == _expected_multinomial_wire_bytes(4, 8)  # 8 bytes
+
+    def test_wire_size_k3_8bit(self):
+        """k=3, 8-bit: 4 + 8×5 = 44 bits = 6 bytes."""
+        beliefs_q, u_q, br_q = quantize_multinomial(
+            [0.5, 0.3, 0.1], 0.1, [0.4, 0.3, 0.3], precision=8
+        )
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        assert len(data) == _expected_multinomial_wire_bytes(3, 8)  # 6 bytes
+
+    def test_wire_size_k2_8bit(self):
+        """k=2, 8-bit: 4 + 8×3 = 28 bits = 4 bytes."""
+        beliefs_q, u_q, br_q = quantize_multinomial(
+            [0.7, 0.2], 0.1, [0.5, 0.5], precision=8
+        )
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        assert len(data) == _expected_multinomial_wire_bytes(2, 8)  # 4 bytes
+
+    def test_wire_size_k4_16bit(self):
+        """k=4, 16-bit: 4 + 16×7 = 116 bits = 15 bytes."""
+        beliefs_q, u_q, br_q = quantize_multinomial(
+            [0.6, 0.2, 0.1, 0.0], 0.1, [0.25, 0.25, 0.25, 0.25], precision=16
+        )
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=16)
+        assert len(data) == _expected_multinomial_wire_bytes(4, 16)  # 15 bytes
+
+    def test_wire_size_k4_32bit(self):
+        """k=4, 32-bit: 4 + 32×7 = 228 bits = 29 bytes.
+
+        32-bit uses raw floats (matching binomial convention).
+        """
+        data = encode_multinomial_bytes(
+            [0.6, 0.2, 0.1, 0.0], 0.1, [0.25, 0.25, 0.25, 0.25], precision=32
+        )
+        assert len(data) == _expected_multinomial_wire_bytes(4, 32)  # 29 bytes
+
+    def test_wire_size_smaller_than_old_spec(self):
+        """Bit-packed format must be smaller than old spec (k byte + prec byte + values).
+
+        Old spec: 1 (k) + 1 (prec+6 reserved) + (k-1)*n/8 + n/8 + (k-1)*n/8
+                = 2 + n*(2k-1)/8 bytes.
+        New: ceil((4 + n*(2k-1)) / 8) bytes.
+        """
+        for k in [2, 3, 4, 5, 8]:
+            for precision in [8, 16]:
+                old_spec_bytes = 2 + precision * (2 * k - 1) // 8
+                new_bytes = _expected_multinomial_wire_bytes(k, precision)
+                assert new_bytes < old_spec_bytes, (
+                    f"k={k}, {precision}-bit: new ({new_bytes}B) >= old ({old_spec_bytes}B)"
+                )
+
+    # --- Round-trip tests ---
+
+    def test_roundtrip_k4_8bit(self):
+        """Full round-trip: quantize → encode → decode → dequantize."""
+        beliefs = [0.6, 0.2, 0.1, 0.0]
+        u = 0.1
+        base_rates = [0.25, 0.25, 0.25, 0.25]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        assert beliefs_r == beliefs_q
+        assert u_r == u_q
+        assert br_r == br_q
+
+    def test_roundtrip_k3_16bit(self):
+        beliefs = [0.5, 0.3, 0.1]
+        u = 0.1
+        base_rates = [0.4, 0.3, 0.3]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=16)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=16)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=16)
+
+        assert beliefs_r == beliefs_q
+        assert u_r == u_q
+        assert br_r == br_q
+
+    def test_roundtrip_k2_8bit(self):
+        """Binary multinomial round-trip."""
+        beliefs = [0.7, 0.2]
+        u = 0.1
+        base_rates = [0.5, 0.5]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        assert beliefs_r == beliefs_q
+        assert u_r == u_q
+        assert br_r == br_q
+
+    def test_roundtrip_k4_32bit(self):
+        """32-bit float round-trip.
+
+        For 32-bit precision, the convention (matching binomial) is to
+        pass raw [0,1] floats directly — NOT through quantize_multinomial.
+        quantize_multinomial at 32-bit produces integers in [0, 2^32-1]
+        which can't round-trip through float32 exactly.
+        """
+        beliefs = [0.6, 0.2, 0.1, 0.0]
+        u = 0.1
+        base_rates = [0.25, 0.25, 0.25, 0.25]
+
+        # Pass raw floats, not quantized integers
+        data = encode_multinomial_bytes(beliefs, u, base_rates, precision=32)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=32)
+
+        # Float round-trip: transmitted k-1 values exact, derived k-th has IEEE 754 artifacts
+        for i in range(len(beliefs) - 1):
+            assert abs(beliefs_r[i] - beliefs[i]) < 1e-6, \
+                f"beliefs[{i}]: {beliefs_r[i]} != {beliefs[i]}"
+        # Derived b_k = 1.0 - sum(transmitted) - u
+        assert abs(sum(beliefs_r) + u_r - 1.0) < 1e-5
+        assert abs(u_r - u) < 1e-6
+        for i in range(len(base_rates) - 1):
+            assert abs(br_r[i] - base_rates[i]) < 1e-6
+
+    # --- Derived component correctness ---
+
+    def test_derived_bk_correct(self):
+        """b̂_k must be correctly derived after decode: max_val - sum(b̂₁..b̂_{k-1}) - û."""
+        beliefs = [0.5, 0.3, 0.1, 0.0]
+        u = 0.1
+        base_rates = [0.25, 0.25, 0.25, 0.25]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        # The k-th belief is derived, not transmitted
+        expected_bk = 255 - sum(beliefs_r[:-1]) - u_r
+        assert beliefs_r[-1] == expected_bk, \
+            f"Derived b̂_k = {beliefs_r[-1]} != {expected_bk}"
+
+    def test_derived_ak_correct(self):
+        """â_k must be correctly derived: max_val - sum(â₁..â_{k-1})."""
+        beliefs = [0.5, 0.3, 0.1, 0.0]
+        u = 0.1
+        base_rates = [0.4, 0.3, 0.2, 0.1]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        expected_ak = 255 - sum(br_r[:-1])
+        assert br_r[-1] == expected_ak, \
+            f"Derived â_k = {br_r[-1]} != {expected_ak}"
+
+    # --- Constraint preservation through wire ---
+
+    def test_constraint_preserved_through_wire_k4(self):
+        """sum(beliefs_r) + u_r = 255 after encode → decode."""
+        beliefs = [0.4, 0.3, 0.2, 0.0]
+        u = 0.1
+        base_rates = [0.25, 0.25, 0.25, 0.25]
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        assert sum(beliefs_r) + u_r == 255, \
+            f"Constraint violated: {sum(beliefs_r)} + {u_r} = {sum(beliefs_r) + u_r}"
+        assert sum(br_r) == 255, \
+            f"Base rate constraint violated: {sum(br_r)}"
+
+    # --- Elision verification ---
+
+    def test_bk_and_ak_not_on_wire(self):
+        """Wire size proves b̂_k and â_k are not transmitted.
+
+        If they were, the wire would be 4 + n*(2k+1) bits.
+        With elision: 4 + n*(2k-1) bits — saving 2n bits (2 values).
+        """
+        for k in [2, 3, 4, 5]:
+            beliefs = [1.0/k] * k
+            # Adjust last to ensure exact sum
+            beliefs[-1] = 1.0 - sum(beliefs[:-1]) - 0.1
+            u = 0.1
+            base_rates = [1.0/k] * k
+            base_rates[-1] = 1.0 - sum(base_rates[:-1])
+
+            beliefs_q, u_q, br_q = quantize_multinomial(
+                beliefs, u, base_rates, precision=8
+            )
+            data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+
+            # Wire size with elision (our format)
+            expected_with_elision = _expected_multinomial_wire_bytes(k, 8)
+            # Wire size WITHOUT elision would be ceil((4 + 8*(2k+1))/8)
+            expected_without_elision = (4 + 8 * (2 * k + 1) + 7) // 8
+
+            assert len(data) == expected_with_elision, \
+                f"k={k}: wire size {len(data)} != expected {expected_with_elision}"
+            assert len(data) < expected_without_elision, \
+                f"k={k}: elision did not save bytes: {len(data)} >= {expected_without_elision}"
+
+    # --- Shannon efficiency ---
+
+    def test_k_field_efficiency(self):
+        """k field: 4 wire bits for 15 valid states.
+
+        Shannon info = log₂(15) ≈ 3.91 bits. Efficiency = 3.91/4 = 97.6%.
+        This is near-optimal — a 3-bit field would only support k ≤ 7.
+        """
+        info_bits = math.log2(15)  # 15 valid k values (1-15)
+        wire_bits = 4
+        efficiency = info_bits / wire_bits
+        assert efficiency > 0.97, f"k field efficiency {efficiency:.3f} < 0.97"
+
+    # --- k boundary values ---
+
+    def test_k_15_max_domain(self):
+        """k=15 (maximum supported domain cardinality) round-trips."""
+        k = 15
+        # Uniform beliefs with small u
+        b_val = 0.06
+        beliefs = [b_val] * k
+        u = 1.0 - sum(beliefs)
+        base_rates = [1.0/k] * k
+        base_rates[-1] = 1.0 - sum(base_rates[:-1])
+
+        beliefs_q, u_q, br_q = quantize_multinomial(beliefs, u, base_rates, precision=8)
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        assert len(data) == _expected_multinomial_wire_bytes(15, 8)
+        assert beliefs_r == beliefs_q
+        assert u_r == u_q
+
+    def test_k_1_degenerate(self):
+        """k=1 (degenerate: single outcome) round-trips."""
+        beliefs_q, u_q, br_q = quantize_multinomial(
+            [0.8], 0.2, [1.0], precision=8
+        )
+        data = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=8)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(data, precision=8)
+
+        assert beliefs_r == beliefs_q
+        assert u_r == u_q
+        # k=1: 4 + 8*(2*1-1) = 12 bits = 2 bytes
+        assert len(data) == 2
+
+    # --- Hypothesis property-based ---
+
+    @given(
+        k=st.integers(min_value=2, max_value=10),
+        precision=st.sampled_from([8, 16]),
+        data=st.data(),
+    )
+    @settings(max_examples=200)
+    def test_roundtrip_property(self, k, precision, data):
+        """Property: encode → decode recovers exact quantized values for any valid multinomial."""
+        # Generate k random beliefs summing to < 1, with u = remainder
+        raw_beliefs = [data.draw(st.floats(min_value=0.01, max_value=0.5)) for _ in range(k)]
+        total_b = sum(raw_beliefs)
+        assume(total_b < 0.99)  # need room for u > 0
+        # Normalize so sum(beliefs) + u = 1
+        u = 1.0 - total_b
+        assume(u > 0.001)
+
+        # Base rates: uniform
+        base_rates = [1.0 / k] * k
+        base_rates[-1] = 1.0 - sum(base_rates[:-1])
+
+        beliefs_q, u_q, br_q = quantize_multinomial(raw_beliefs, u, base_rates, precision=precision)
+        wire = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=precision)
+        beliefs_r, u_r, br_r = decode_multinomial_bytes(wire, precision=precision)
+
+        assert beliefs_r == beliefs_q, f"beliefs mismatch: {beliefs_r} != {beliefs_q}"
+        assert u_r == u_q, f"u mismatch: {u_r} != {u_q}"
+        assert br_r == br_q, f"base_rates mismatch: {br_r} != {br_q}"
+
+        # Constraint preserved through wire
+        assert sum(beliefs_r) + u_r == (1 << precision) - 1
+        assert sum(br_r) == (1 << precision) - 1
+
+    @given(
+        k=st.integers(min_value=2, max_value=10),
+        precision=st.sampled_from([8, 16]),
+        data=st.data(),
+    )
+    @settings(max_examples=200)
+    def test_wire_size_property(self, k, precision, data):
+        """Property: wire size is exactly ceil((4 + n*(2k-1)) / 8) bytes."""
+        raw_beliefs = [data.draw(st.floats(min_value=0.01, max_value=0.5)) for _ in range(k)]
+        total_b = sum(raw_beliefs)
+        assume(total_b < 0.99)
+        u = 1.0 - total_b
+        assume(u > 0.001)
+
+        base_rates = [1.0 / k] * k
+        base_rates[-1] = 1.0 - sum(base_rates[:-1])
+
+        beliefs_q, u_q, br_q = quantize_multinomial(raw_beliefs, u, base_rates, precision=precision)
+        wire = encode_multinomial_bytes(beliefs_q, u_q, br_q, precision=precision)
+
+        expected = _expected_multinomial_wire_bytes(k, precision)
+        assert len(wire) == expected, \
+            f"k={k}, {precision}-bit: wire {len(wire)}B != expected {expected}B"

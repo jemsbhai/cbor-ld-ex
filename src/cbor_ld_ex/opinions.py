@@ -17,6 +17,8 @@ Precision modes (Table 1, §4.3):
 import struct
 from typing import Union
 
+from cbor_ld_ex.bitpack import BitWriter, BitReader
+
 # Valid precision modes per Table 1
 _VALID_PRECISIONS = {8, 16, 32}
 
@@ -89,6 +91,13 @@ def quantize_binomial(
     _validate_precision(precision)
     _validate_binomial(b, d, u, a)
 
+    # 32-bit mode: IEEE 754, no quantization. Return raw floats.
+    # This matches the wire format (encode_opinion_bytes packs float32)
+    # and eliminates the footgun of producing uint32-scale integers
+    # that can't round-trip through float32.
+    if precision == 32:
+        return (float(b), float(d), float(u), float(a))
+
     mv = _max_val(precision)
 
     b_q = _quantize_single(b, mv)
@@ -118,6 +127,11 @@ def dequantize_binomial(
     dividing each by (2^n - 1) gives a sum of exactly 1.
     """
     _validate_precision(precision)
+
+    # 32-bit mode: values are already raw floats. Identity.
+    if precision == 32:
+        return (float(b_q), float(d_q), float(u_q), float(a_q))
+
     mv = _max_val(precision)
 
     # Each component is independently dequantized via Definition 9 inverse.
@@ -182,6 +196,14 @@ def quantize_multinomial(
             f"sum(base_rates) must equal 1.0: got {br_total}"
         )
 
+    # 32-bit mode: IEEE 754, no quantization. Return raw floats.
+    if precision == 32:
+        return (
+            [float(b) for b in beliefs],
+            float(u),
+            [float(a) for a in base_rates],
+        )
+
     mv = _max_val(precision)
 
     # Quantize k-1 beliefs independently, plus uncertainty
@@ -224,6 +246,15 @@ def dequantize_multinomial(
     because sum(beliefs_q) + u_q = 2^n - 1 by construction.
     """
     _validate_precision(precision)
+
+    # 32-bit mode: values are already raw floats. Identity.
+    if precision == 32:
+        return (
+            [float(b) for b in beliefs_q],
+            float(u_q),
+            [float(a) for a in base_rates_q],
+        )
+
     mv = _max_val(precision)
 
     # Each component independently dequantized. See dequantize_binomial
@@ -305,3 +336,164 @@ def decode_opinion_bytes(
         b, d, a = struct.unpack(">fff", data)
         u = 1.0 - b - d
         return (b, d, u, a)
+
+
+# -------------------------------------------------------------------------
+# Multinomial byte encoding — bit-packed wire format
+#
+# Wire format (bit-packed via BitWriter, MSB-first):
+#   [4 bits]  k (domain cardinality, 1–15; 0 reserved)
+#   [n × (k-1)]  b̂₁..b̂_{k-1} (independently quantized)
+#   [n × 1]      û (independently quantized)
+#   [n × (k-1)]  â₁..â_{k-1} (independently quantized)
+#   Pad to byte boundary with zero bits.
+#
+# NOT transmitted (derived by decoder):
+#   b̂_k = (2ⁿ−1) − sum(b̂₁..b̂_{k-1}) − û
+#   â_k = (2ⁿ−1) − sum(â₁..â_{k-1})
+#
+# precision_mode is NOT in the payload — it's already in the annotation
+# header. This eliminates the wasted bits from the old spec format.
+#
+# Total wire bits: 4 + n*(2k-1).
+# Total wire bytes: ceil((4 + n*(2k-1)) / 8).
+# -------------------------------------------------------------------------
+
+def encode_multinomial_bytes(
+    beliefs_q: list[int],
+    u_q: int,
+    base_rates_q: list[int],
+    precision: int = 8,
+) -> bytes:
+    """Bit-packed multinomial opinion wire encoding.
+
+    Transmits k-1 beliefs, û, and k-1 base rates. The k-th belief
+    and k-th base rate are derived by the decoder (zero information
+    content — same principle as binomial û elision).
+
+    Wire layout (MSB-first, bit-packed):
+      [4 bits]       k (domain cardinality)
+      [n × (k-1)]   b̂₁..b̂_{k-1}
+      [n]            û
+      [n × (k-1)]   â₁..â_{k-1}
+      Pad to byte boundary.
+
+    Args:
+        beliefs_q: All k quantized belief values (including derived k-th).
+        u_q: Quantized uncertainty.
+        base_rates_q: All k quantized base rate values (including derived k-th).
+        precision: Quantization precision (8, 16, or 32).
+
+    Returns:
+        Bit-packed bytes.
+    """
+    _validate_precision(precision)
+
+    k = len(beliefs_q)
+    if k < 1 or k > 15:
+        raise ValueError(f"Domain cardinality k must be 1–15, got {k}")
+    if len(base_rates_q) != k:
+        raise ValueError(
+            f"beliefs_q and base_rates_q must have same length: "
+            f"{k} vs {len(base_rates_q)}"
+        )
+
+    w = BitWriter()
+
+    # k: 4 bits
+    w.write(k, 4)
+
+    # Determine value width for bit-packing
+    if precision == 32:
+        value_width = 32
+    else:
+        value_width = precision
+
+    # k-1 beliefs (skip the k-th — derived by decoder)
+    for i in range(k - 1):
+        if precision == 32:
+            # Pack float32 as its uint32 bit pattern
+            bits = struct.unpack(">I", struct.pack(">f", float(beliefs_q[i])))[0]
+            w.write(bits, 32)
+        else:
+            w.write(beliefs_q[i], value_width)
+
+    # û
+    if precision == 32:
+        bits = struct.unpack(">I", struct.pack(">f", float(u_q)))[0]
+        w.write(bits, 32)
+    else:
+        w.write(u_q, value_width)
+
+    # k-1 base rates (skip the k-th — derived by decoder)
+    for i in range(k - 1):
+        if precision == 32:
+            bits = struct.unpack(">I", struct.pack(">f", float(base_rates_q[i])))[0]
+            w.write(bits, 32)
+        else:
+            w.write(base_rates_q[i], value_width)
+
+    return w.to_bytes()
+
+
+def decode_multinomial_bytes(
+    data: bytes,
+    precision: int = 8,
+) -> tuple[list, int, list]:
+    """Bit-packed multinomial opinion wire decoding.
+
+    Reads k from the first 4 bits, then k-1 beliefs, û, k-1 base rates.
+    Derives the k-th belief and k-th base rate.
+
+    Args:
+        data: Bit-packed bytes from encode_multinomial_bytes().
+        precision: Quantization precision (8, 16, or 32).
+
+    Returns:
+        (beliefs_q, u_q, base_rates_q) where beliefs_q and base_rates_q
+        have length k (including derived k-th values).
+    """
+    _validate_precision(precision)
+
+    r = BitReader(data)
+
+    # k: 4 bits
+    k = r.read(4)
+    if k < 1 or k > 15:
+        raise ValueError(f"Invalid domain cardinality k={k}")
+
+    mv = _max_val(precision) if precision != 32 else None
+
+    if precision == 32:
+        value_width = 32
+    else:
+        value_width = precision
+
+    def _read_value():
+        raw = r.read(value_width)
+        if precision == 32:
+            return struct.unpack(">f", struct.pack(">I", raw))[0]
+        return raw
+
+    # k-1 beliefs
+    beliefs_q = [_read_value() for _ in range(k - 1)]
+
+    # û
+    u_q = _read_value()
+
+    # k-1 base rates
+    base_rates_q = [_read_value() for _ in range(k - 1)]
+
+    # Derive k-th belief: max_val - sum(b̂₁..b̂_{k-1}) - û
+    if precision == 32:
+        b_k = 1.0 - sum(beliefs_q) - u_q
+        beliefs_q.append(b_k)
+        a_k = 1.0 - sum(base_rates_q)
+        base_rates_q.append(a_k)
+    else:
+        b_k = mv - sum(beliefs_q) - u_q
+        beliefs_q.append(b_k)
+        a_k = mv - sum(base_rates_q)
+        base_rates_q.append(a_k)
+
+    return (beliefs_q, u_q, base_rates_q)
