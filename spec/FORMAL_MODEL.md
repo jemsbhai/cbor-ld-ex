@@ -1,9 +1,9 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.4.0-draft  
+**Version:** 0.4.1-draft  
 **Date:** 2026-03-26  
 **Authors:** Muntaser Syed  
-**Status:** Working Draft — Structural review fixes applied (v0.3.0 → v0.4.0)  
+**Status:** Working Draft — Fourth review round fixes applied (v0.4.0 → v0.4.1)  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
 **Target Venue:** IETF 125 Hackathon, March 14–15 2026  
 
@@ -364,7 +364,17 @@ b̂ₖ  = (2ⁿ − 1) − (∑ᵢ₌₁ᵏ⁻¹ b̂ᵢ) − û
 
 **(b)** `Q_n⁻¹(∑ᵢ b̂ᵢ) + Q_n⁻¹(û) = 1.0` (exact upon reconstruction).
 
-**(c)** `b̂ₖ ≥ 0` provided individual rounding errors don't exceed `bₖ(2ⁿ − 1)`. The encoder MUST clamp: if `b̂ₖ < 0`, reduce the largest `b̂ᵢ` (for `i < k`) by 1 and recompute.
+**(c)** `b̂ₖ ≥ 0` provided `n ≥ 2`. For `k` independent roundings (`k−1` beliefs + `u`), the sum of rounding errors can reach up to `k/2` quanta. When `k > 2`, the derived component `b̂ₖ` may be negative by more than 1. The encoder MUST apply iterative fractional-part clamping:
+
+```
+WHILE b̂ₖ < 0:
+  Among all independently quantized components (b̂₁..b̂ₖ₋₁, û),
+  find the one whose pre-rounding value had the LARGEST fractional part
+  (i.e., rounded up by the most). Decrement that component by 1.
+  Recompute: b̂ₖ = (2ⁿ − 1) − (∑ᵢ₌₁ᵏ⁻¹ b̂ᵢ) − û
+```
+
+This distributes clamping corrections across components proportional to their rounding overshoot, avoiding the systematic bias of always targeting the single largest component. The loop terminates in at most `⌈k/2⌉` iterations.
 
 *Proof:* Analogous to Theorem 1, extended to `k + 1` components. ∎
 
@@ -520,8 +530,12 @@ If has_provenance_chain = 1:
 If has_trust_info = 1:
   [8 bits] agent_id_length
   [variable] agent_id (UTF-8, compact)
-  [variable] trust opinion (per precision_mode)
+  [2 bits] trust_precision_mode    (00=8-bit, 01=16-bit, 10=32-bit, 11=reserved)
+  [6 bits] reserved
+  [variable] trust opinion (per trust_precision_mode — independent of header precision_mode)
 ```
+
+The trust opinion's precision is specified by its own `trust_precision_mode` field, NOT inherited from the header's `precision_mode`. This allows a gateway to carry a high-precision primary opinion (e.g., 16-bit fused result) alongside a lower-precision trust weight (e.g., 8-bit). The 1-byte overhead for the precision+reserved field is negligible at Tier 3.
 
 **Extension Block Ordering (Mandatory).** When multiple extension blocks are present in a Tier 3 annotation, they MUST appear in the following strict order within the annotation byte string:
 
@@ -672,7 +686,7 @@ IoT data is inherently temporal. Compliance is often time-bounded ("temperature 
 
 **Consequence for Axiom 2:** Decay produces a valid opinion from a valid opinion — closure holds.
 
-**Consequence for Axiom 3:** Quantized decay applies the factor to quantized components. Given `b̂, d̂` in the quantized domain, the encoder computes `b̂' = round(λ · Q_n⁻¹(b̂) · (2ⁿ−1))`, `d̂' = round(λ · Q_n⁻¹(d̂) · (2ⁿ−1))`, and derives `û' = (2ⁿ−1) − b̂' − d̂'`. The SL constraint is preserved by construction.
+**Consequence for Axiom 3:** Quantized decay applies the factor to quantized components. Given `b̂, d̂` in the quantized domain, the encoder computes `b̂' = round(λ · Q_n⁻¹(b̂) · (2ⁿ−1))`, `d̂' = round(λ · Q_n⁻¹(d̂) · (2ⁿ−1))`. Since both roundings can independently round up, `b̂' + d̂'` may exceed `2ⁿ−1` — the same edge case as Theorem 1(c). The **Symmetric Clamping Rule (§4.2) MUST be applied** to `b̂'` and `d̂'` before deriving `û' = (2ⁿ−1) − b̂' − d̂'`. With clamping applied, the SL constraint is preserved by construction. This applies equally to the expiry trigger (§7.5, Definition 19), whose outputs `b' = round(γ · b̂)` and `d' = round(d̂ + (1−γ) · b̂)` are also subject to rounding overshoot.
 
 ### 7.2 Decay Function Registry
 
@@ -824,6 +838,8 @@ For Tier 1 devices emitting frequent readings (e.g., every 5 seconds), full opin
 ```
 
 The receiver reconstructs: `b̂_new = b̂_prev + Δb̂`, `d̂_new = d̂_prev + Δd̂`, `û_new = (2ⁿ−1) − b̂_new − d̂_new`.
+
+**Encoder range check (mandatory fallback):** Before encoding a delta opinion, the encoder MUST verify that both deltas fit in a signed 8-bit integer: `|Δb̂| ≤ 127` AND `|Δd̂| ≤ 127`. If either delta exceeds this range (e.g., a step-change from b̂ = 220 to b̂ = 50 produces Δb̂ = −170, which overflows int8), the encoder MUST abandon delta mode for that message and transmit a full opinion using `precision_mode = 00`. This fallback is transparent to the receiver — it simply sees a full-mode message and updates its state accordingly. Delta mode resumes on the next message if the deltas are within range.
 
 **Constraint:** The receiver MUST verify `b̂_new, d̂_new ≥ 0` and `b̂_new + d̂_new ≤ 2ⁿ−1`. If violated, the delta is invalid and the receiver MUST request a full opinion retransmission (via CoAP RST or application-level NACK).
 
@@ -1355,4 +1371,4 @@ CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~3
 
 ---
 
-*End of document. v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), Phase 0 TurboQuant integration (§4.6–4.9), and multinomial wire optimization (§4.4).*
+*End of document. v0.4.1 changes: iterative fractional-part multinomial clamping (§4.4 Theorem 3c), mandatory delta-to-full fallback on range overflow (§7.6), trust_precision_mode field in trust_info block (§5.1), symmetric clamping mandate for temporal decay and expiry trigger outputs (§7.1). v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), Phase 0 TurboQuant integration (§4.6–4.9), and multinomial wire optimization (§4.4).*
