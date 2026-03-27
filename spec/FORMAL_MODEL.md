@@ -1,9 +1,9 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.3.0-draft  
-**Date:** 2026-03-23  
+**Version:** 0.4.0-draft  
+**Date:** 2026-03-26  
 **Authors:** Muntaser Syed  
-**Status:** Working Draft — Iterative Development  
+**Status:** Working Draft — Structural review fixes applied (v0.3.0 → v0.4.0)  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
 **Target Venue:** IETF 125 Hackathon, March 14–15 2026  
 
@@ -292,9 +292,20 @@ The uncertainty component `û` is **derived, never independently quantized**.
 
 *Proof of (b):* `Q_n⁻¹(b̂) + Q_n⁻¹(d̂) + Q_n⁻¹(û) = (b̂ + d̂ + û) / (2ⁿ − 1) = (2ⁿ − 1) / (2ⁿ − 1) = 1`. ∎
 
-*Proof of (c):* We need `b̂ + d̂ ≤ 2ⁿ − 1`. Since `b + d ≤ 1` (because `u ≥ 0`), we have `b̂ ≤ round(b(2ⁿ − 1))` and `d̂ ≤ round(d(2ⁿ − 1))`. In the worst case, both round up by 0.5/(2ⁿ − 1), giving `b̂ + d̂ ≤ (b + d)(2ⁿ − 1) + 1 ≤ 2ⁿ − 1 + 1 = 2ⁿ`. However, we need `b̂ + d̂ ≤ 2ⁿ − 1`. This fails only when `b + d = 1` (i.e., `u = 0`) and both round up, which requires `b(2ⁿ − 1)` and `d(2ⁿ − 1)` to both have fractional part exactly 0.5. For `n ≥ 2`, this is a measure-zero edge case that the encoder MUST handle by clamping: if `b̂ + d̂ > 2ⁿ − 1`, decrement `d̂` by 1. ∎
+*Proof of (c):* We need `b̂ + d̂ ≤ 2ⁿ − 1`. Since `b + d ≤ 1` (because `u ≥ 0`), we have `b̂ ≤ round(b(2ⁿ − 1))` and `d̂ ≤ round(d(2ⁿ − 1))`. In the worst case, both round up by 0.5/(2ⁿ − 1), giving `b̂ + d̂ ≤ (b + d)(2ⁿ − 1) + 1 ≤ 2ⁿ − 1 + 1 = 2ⁿ`. However, we need `b̂ + d̂ ≤ 2ⁿ − 1`. This fails only when `b + d = 1` (i.e., `u = 0`) and both round up, which requires `b(2ⁿ − 1)` and `d(2ⁿ − 1)` to both have fractional part exactly 0.5. For `n ≥ 2`, this is a measure-zero edge case that the encoder MUST handle via symmetric clamping (see Remark below): decrement exactly one of b̂ or d̂ by 1, chosen by fractional-part comparison. ∎
 
-**Remark (Clamping rule).** The encoder MUST enforce `û ≥ 0` by checking `b̂ + d̂ ≤ 2ⁿ − 1` after rounding. If violated, `d̂` is decremented by 1. The choice to clamp `d̂` rather than `b̂` introduces a marginal bias toward belief over disbelief in the clamping edge case. This bias direction is documented and MAY be made configurable in future revisions.
+**Remark (Symmetric Clamping Rule).** The encoder MUST enforce `û ≥ 0` by checking `b̂ + d̂ ≤ 2ⁿ − 1` after rounding. If violated, exactly one of b̂ or d̂ MUST be decremented by 1. The choice of which to decrement is determined by **fractional-part comparison**:
+
+```
+frac_b = b × (2ⁿ − 1) − floor(b × (2ⁿ − 1))
+frac_d = d × (2ⁿ − 1) − floor(d × (2ⁿ − 1))
+```
+
+The component whose pre-rounding value had the **larger fractional part** (i.e., rounded up by more) is decremented. If `frac_b > frac_d`, decrement b̂. If `frac_d > frac_b`, decrement d̂.
+
+**Tiebreaker (frac_b = frac_d):** This occurs only when b = d exactly (since b + d = 1 implies both have the same distance to their nearest quantization point). In this case, the clamping direction is determined by the **least significant bit of â**: if `â & 1 == 0`, decrement d̂; if `â & 1 == 1`, decrement b̂. This produces a deterministic, stateless alternation that washes out to zero net bias across opinions with varying base rates.
+
+**Properties:** (a) The rule is **deterministic**: given (b, d, u, a, n), the output is unique. (b) The rule is **symmetric**: swapping b and d swaps the clamping target. Neither component has structural priority. (c) The clamping edge case triggers ONLY when b + d = 1 (u = 0) and both b·(2ⁿ−1) and d·(2ⁿ−1) have fractional part ≥ 0.5 — a measure-zero set in practice. (d) The tiebreaker uses â (already available) rather than an external timestamp, keeping the quantizer stateless and context-free.
 
 ### 4.3 Quantization Error Bounds
 
@@ -316,14 +327,16 @@ The uncertainty component `û` is **derived, never independently quantized**.
 
 **Table 1: Precision characteristics by mode.**
 
-The wire format transmits **3 values only** (b̂, d̂, â). The uncertainty component û is NEVER transmitted — it carries zero bits of Shannon information because û = (2ⁿ−1) − b̂ − d̂. The decoder derives it.
+The wire format transmits **3 values only** (b̂, d̂, â) for modes 00–10. The uncertainty component û is NEVER transmitted — it carries zero bits of Shannon information because û = (2ⁿ−1) − b̂ − d̂. The decoder derives it. Mode 11 (delta) transmits **2 values** (Δb̂, Δd̂) — the base rate â is unchanged from the previous message.
 
-| Precision Mode | Bits/value | Max error (b,d) | Max error (u) | Wire bytes (3 values) |
-|---|---|---|---|---|
-| 00 (8-bit) | 8 | ≈ 0.00196 | ≈ 0.00392 | 3 |
-| 01 (16-bit) | 16 | ≈ 0.0000076 | ≈ 0.0000153 | 6 |
-| 10 (32-bit float) | 32 | IEEE 754 | IEEE 754 | 12 |
-| 11 (reserved) | — | — | — | — |
+| Precision Mode | Code | Bits/value | Max error (b,d) | Max error (u) | Wire bytes |
+|---|---|---|---|---|---|
+| 8-bit full | 00 | 8 | ≈ 0.00196 | ≈ 0.00392 | 3 (b̂, d̂, â) |
+| 16-bit full | 01 | 16 | ≈ 0.0000076 | ≈ 0.0000153 | 6 |
+| 32-bit float | 10 | 32 | IEEE 754 | IEEE 754 | 12 |
+| 8-bit delta | 11 | 8 | ≈ 0.00392 | ≈ 0.00784 | **2** (Δb̂, Δd̂) |
+
+Delta mode error bounds are 2× full mode because the delta accumulates rounding error from both the original quantization and the delta quantization. Receivers MUST verify reconstructed values remain valid (§7.6).
 
 ### 4.4 Constrained Multinomial Quantization
 
@@ -434,9 +447,10 @@ Bit  Width  Field
 
 **1 byte fixed header.** No context version, no operator provenance, no sub-tier. Minimum viable semantic annotation.
 
-If `has_opinion = 1`: opinion payload follows per `precision_mode`.
+If `has_opinion = 1`: opinion payload follows per `precision_mode`. When `precision_mode = 11` (delta mode), the opinion payload is 2 bytes (Δb̂, Δd̂) instead of the standard 3 bytes (b̂, d̂, â) — see §7.6.
 
-Typical Tier 1 message: **4 bytes** (1 header + 3 opinion at 8-bit; û not transmitted).
+Typical Tier 1 message: **4 bytes** (1 header + 3 opinion at 8-bit full; û not transmitted).
+Minimum Tier 1 message with opinion: **3 bytes** (1 header + 2 delta opinion at 8-bit delta).
 Minimum Tier 1 message: **1 byte** (header only, no opinion).
 
 **Tier Class 01 — Edge (Tier 2)**
@@ -507,6 +521,28 @@ If has_trust_info = 1:
   [8 bits] agent_id_length
   [variable] agent_id (UTF-8, compact)
   [variable] trust opinion (per precision_mode)
+```
+
+**Extension Block Ordering (Mandatory).** When multiple extension blocks are present in a Tier 3 annotation, they MUST appear in the following strict order within the annotation byte string:
+
+```
+[header: 4 bytes]
+[opinion: per precision_mode]
+[1. extended_context: 4 bytes, if has_extended_context = 1]
+[2. provenance_chain: variable, if has_provenance_chain = 1]
+[3. trust_info: variable, if has_trust_info = 1]
+[4. temporal_block: remaining bytes, if present — see §7.4]
+```
+
+This ordering is NOT negotiable. Implementations MUST serialize and parse blocks in this exact sequence. Blocks 1–3 each contain their own length indicators (extended_context is fixed at 4 bytes; provenance_chain has a chain_length byte; trust_info has an agent_id_length byte). The temporal block (§7.4) uses the "remaining bytes" detection mechanism and therefore MUST be the final block. Future extension block types MUST be assigned a position BEFORE the temporal block and MUST carry their own length indicators.
+
+**Tier 3 Byte 3 (reserved/flags) allocation:**
+
+```
+Bit  Width  Field
+───────────────────────────
+0    1      has_extended_digest        (0 = 64-bit digest, 1 = 128-bit; see §9.4)
+1    7      reserved
 ```
 
 **Tier Class 11 — Reserved**
@@ -676,7 +712,7 @@ Step 2: ω_fused = cumulative_fuse(ω'₁, ..., ω'ₙ)
 
 The temporal annotation `τ(w, λ, triggers)` from Definition 6 is encoded as a **bit-packed extension block** appended after `[header][opinion]` in the annotation byte string. The extension block is NOT a separate CBOR structure — it occupies the remaining bytes of the annotation payload.
 
-**Detection mechanism:** Extensions are detected by **remaining bytes** after the header and opinion have been parsed. The header size is fixed per tier (1 byte Tier 1, 4 bytes Tier 2/3) and the opinion size is deterministic from `precision_mode` (3/6/12 bytes for 8/16/32-bit). If `len(annotation_bytes) > header_size + opinion_size`, the remaining bytes are an extension block. This design achieves **zero overhead when extensions are absent** — no flags byte is needed.
+**Detection mechanism:** Extensions are detected by **remaining bytes** after all preceding content has been parsed. For Tier 1 and Tier 2, this is after the header and opinion. For Tier 3, this is after the header, opinion, and any preceding extension blocks (extended_context → provenance_chain → trust_info, per §5.1 Extension Block Ordering). The temporal block, when present, is always the **final block** in the annotation byte string. The opinion size is deterministic from `precision_mode` (3/6/12/2 bytes for 8-bit/16-bit/32-bit/delta modes respectively). This design achieves **zero overhead when extensions are absent** — no flags byte is needed.
 
 **Bit-packed layout (MSB-first):**
 
@@ -780,7 +816,7 @@ Key property: lawfulness transfers to violation, NOT to uncertainty. An expired 
 
 For Tier 1 devices emitting frequent readings (e.g., every 5 seconds), full opinion encoding on every message is wasteful when the compliance status and opinion change slowly.
 
-**Definition 22 (Delta Opinion).** When the compliance status and precision mode are unchanged from the previous message, a Tier 1 device MAY send a **delta opinion** by setting a reserved bit in the header. The delta encoding transmits:
+**Definition 22 (Delta Opinion).** When the compliance status is unchanged from the previous message, a Tier 1 device MAY send a **delta opinion** by setting `precision_mode = 11` (delta mode) in the header. This signals to the parser that the opinion payload is 2 bytes (Δb̂, Δd̂) rather than the standard 3 bytes (b̂, d̂, â). The base rate â is unchanged from the previous message and is NOT retransmitted. The delta encoding transmits:
 
 ```
 [1 byte]  Δb̂ (signed 8-bit: change in quantized belief, range −128 to +127)
@@ -899,7 +935,7 @@ Cohesion in `[0, 1]` where 1 = perfect agreement. The gateway MAY include the co
 
 The provenance chain (§6) is the audit trail. If an attacker can modify chain entries undetected, the entire compliance determination is undermined.
 
-**Definition 27 (Provenance Entry Wire Format).** Each provenance entry is a **fixed 16-byte (128-bit) structure with zero waste**:
+**Definition 27 (Standard Provenance Entry — 16 bytes).** For Class 1/2 threat environments (Tier 1 → Tier 2 pipelines, benign failures, Byzantine faults). Each entry is a **fixed 16-byte (128-bit) structure with zero waste**:
 
 ```
 Byte 0:     [origin_tier:2][operator_id:4][precision_mode:2]
@@ -910,6 +946,19 @@ Bytes 8-15: prev_digest (64-bit truncated SHA-256 of previous entry)
 
 **Bit budget:** 2 + 4 + 2 + 8 + 8 + 8 + 32 + 64 = 128 bits = 16 bytes. Zero waste — every bit carries information.
 
+**Definition 27b (Audit-Grade Provenance Entry — 24 bytes).** For Class 3 threat environments (Tier 3 cloud, public networks, regulatory audit):
+
+```
+Byte 0:     [origin_tier:2][operator_id:4][precision_mode:2]
+Bytes 1-3:  b̂, d̂, â (3 × uint8 opinion — û NOT stored, derived)
+Bytes 4-7:  timestamp (uint32, big-endian, seconds since Unix epoch)
+Bytes 8-23: prev_digest (128-bit truncated SHA-256 of previous entry)
+```
+
+**192 bits = 24 bytes.** The additional 8 bytes provide 128-bit second pre-image resistance and birthday-bound collision resistance of 2⁶⁴ — meeting the minimum security level for modern cryptographic protocols (NIST SP 800-57).
+
+**Format signaling:** The `has_extended_digest` flag in Tier 3 byte 3 (§5.1) selects the entry format. When `has_extended_digest = 0`: standard 16-byte entries. When `has_extended_digest = 1`: audit-grade 24-byte entries.
+
 **Design rationale:**
 - û is NOT stored — it is derived as `255 − b̂ − d̂` (Axiom 3). Storing û would waste 8 bits per entry.
 - Opinion is fixed at 8-bit precision (3 bytes). This is sufficient for provenance audit purposes; the full-precision opinion is in the annotation itself.
@@ -918,12 +967,13 @@ Bytes 8-15: prev_digest (64-bit truncated SHA-256 of previous entry)
 **Definition 28 (Chained Digest).** The digest linking entry `eᵢ` to entry `eᵢ₊₁` is:
 
 ```
-prev_digest(eᵢ₊₁) = truncate(SHA-256(serialize(eᵢ)), 64 bits)
+Standard:    prev_digest(eᵢ₊₁) = truncate(SHA-256(serialize(eᵢ)), 64 bits)
+Audit-grade: prev_digest(eᵢ₊₁) = truncate(SHA-256(serialize(eᵢ)), 128 bits)
 ```
 
-Where `serialize(eᵢ)` is the 16-byte wire encoding of entry `eᵢ` and `truncate` takes the first 8 bytes of the SHA-256 output.
+Where `serialize(eᵢ)` is the wire encoding of entry `eᵢ` (16 or 24 bytes) and `truncate` takes the first 8 or 16 bytes of the SHA-256 output respectively. All entries in a single chain MUST use the same format.
 
-**Chain origin sentinel:** The first entry in a chain uses `prev_digest = 0x0000000000000000` (8 zero bytes). This sentinel allows the verifier to detect chain truncation: if the first entry does not have the sentinel, entries have been removed from the front of the chain.
+**Chain origin sentinel:** The first entry in a chain uses `prev_digest` as all zero bytes (8 zero bytes for standard, 16 zero bytes for audit-grade). This sentinel allows the verifier to detect chain truncation: if the first entry does not have the sentinel, entries have been removed from the front of the chain.
 
 **Tamper detection properties:**
 
@@ -935,7 +985,14 @@ Where `serialize(eᵢ)` is the 16-byte wire encoding of entry `eᵢ` and `trunca
 
 4. **Insertion:** Inserting a forged entry between `eⱼ` and `eⱼ₊₁` requires computing `SHA-256(serialize(eⱼ))`, which is feasible (SHA-256 is not keyed). Chained digests provide tamper **evidence**, not tamper **prevention**. For tamper prevention, use transport-layer security (§9.5).
 
-**Collision resistance:** The 64-bit truncated SHA-256 provides birthday-bound collision resistance of ~2³² operations. This is sufficient for IoT audit trails where chain lengths are typically < 100 entries. Deployments requiring stronger guarantees SHOULD use full 256-bit SHA-256 at the application layer.
+**Collision resistance:** Standard entries (16 bytes) use 64-bit truncated SHA-256, providing second pre-image resistance of 2⁶⁴ and birthday-bound collision resistance of 2³². This is sufficient for Class 1/2 threat environments (§9.1): accidental corruption, hardware faults, and Byzantine-faulty minorities. For Class 3 threat environments (active adversaries on public networks), deployments MUST use audit-grade entries (24 bytes) with 128-bit truncated SHA-256, providing second pre-image resistance of 2¹²⁸ and collision resistance of 2⁶⁴. The `has_extended_digest` flag in the Tier 3 header (§5.1) signals which format is in use.
+
+**Space cost comparison (8-sensor pipeline, 1 fusion step = 9 entries):**
+
+| Format | Entry size | Chain cost | Threat class |
+|---|---|---|---|
+| Standard | 16 bytes | 144 bytes | Class 1/2 (second pre-image 2⁶⁴) |
+| Audit-grade | 24 bytes | 216 bytes | Class 3 (second pre-image 2¹²⁸) |
 
 **Chain verification algorithm:**
 
@@ -950,7 +1007,7 @@ verify_chain(entries):
 
 Returns `(is_valid, error_index)` where `error_index` is the first invalid entry, or `-1` if the chain is valid.
 
-**Space cost:** A provenance chain with `n` entries costs exactly `16n` bytes. For a typical Tier 1 → Tier 2 pipeline with 8 sensors and 1 fusion step: `16 × 9 = 144 bytes`. This is carried at Tier 3 only — Tier 1 and Tier 2 do not transmit chains (§6.2).
+**Space cost:** A standard provenance chain with `n` entries costs exactly `16n` bytes; an audit-grade chain costs `24n` bytes. For a typical Tier 1 → Tier 2 pipeline with 8 sensors and 1 fusion step: 144 bytes (standard) or 216 bytes (audit-grade). Chains are carried at Tier 3 only — Tier 1 and Tier 2 do not transmit chains (§6.2).
 
 **Tier 1 exception:** Tier 1 devices do not transmit provenance chains (§6.2). The integrity of Tier 1 messages is protected at the transport layer (DTLS or OSCORE, §9.5), not at the annotation layer.
 
@@ -1108,16 +1165,24 @@ For each header field, the Shannon information content is `H(field) = log₂(num
 | delegation_flag | 2 | 1.000 | 1 | 100% |
 | origin_tier | 3 | 1.585 | 2 | 79.2% |
 | has_opinion | 2 | 1.000 | 1 | 100% |
-| precision_mode | 3 | 1.585 | 2 | 79.2% |
-| **Total header** | | **6.755** | **8** | **84.4%** |
+| precision_mode | 4 | 2.000 | 2 | **100%** |
+| **Total header** | | **7.170** | **8** | **89.6%** |
 
 **8-bit opinion payload (3 wire bytes = 24 wire bits):**
 
 The opinion (b̂, d̂, â) is constrained: b̂ + d̂ ≤ 255. The number of valid (b̂, d̂) pairs is `∑ₛ₌₀²⁵⁵ (s+1) = 256 × 257 / 2 = 32,896`. The Shannon information is `log₂(32,896) ≈ 15.006` bits for (b̂, d̂) jointly, plus `log₂(256) = 8` bits for â, totaling `23.006` bits in 24 wire bits = **95.9% efficiency**.
 
-**Tier 1 annotation total (4 bytes = 32 wire bits):**
+**Tier 1 full annotation total (4 bytes = 32 wire bits):**
 
-`6.755 + 23.006 = 29.761` Shannon bits in 32 wire bits = **93.0% bit efficiency**.
+`7.170 + 23.006 = 30.176` Shannon bits in 32 wire bits = **94.3% bit efficiency**.
+
+**Tier 1 delta annotation total (3 bytes = 24 wire bits):**
+
+The delta opinion (Δb̂, Δd̂) carries `log₂(256) + log₂(256) = 16` bits of information in 16 wire bits = 100% efficiency. Combined with the header:
+
+`7.170 + 16.000 = 23.170` Shannon bits in 24 wire bits = **96.5% bit efficiency**.
+
+Delta mode achieves the highest annotation bit efficiency of any CBOR-LD-ex encoding — both smaller (3 bytes vs. 4 bytes) AND higher information density (96.5% vs. 94.3%) than full 8-bit mode.
 
 ### 11.3 Six-Way Benchmark
 
@@ -1150,7 +1215,7 @@ The following claims are verified as **universal invariants** over all 38 benchm
 3. **Our key+value compression ≤ jsonld-ex context-only compression** for all scenarios. Full `ContextRegistry` beats context-URL-only compression.
 4. **CBOR-LD-ex carries MORE semantic fields while being SMALLER** than data-only encodings.
 5. **All Tier 1 payloads fit a single 802.15.4 frame** (≤ 111 bytes after CoAP overhead).
-6. **Tier 1 annotation bit efficiency > 70%** for all scenarios (actual: 93% for 8-bit).
+6. **Tier 1 annotation bit efficiency > 70%** for all scenarios (actual: 94.3% for 8-bit full, 96.5% for 8-bit delta).
 7. **Full size ordering: CBOR-LD-ex < our+ann ≤ jex+ann < JSON-LD** for all scenarios.
 8. **Shannon information ≤ wire bits** for all annotations (physical law).
 9. **û never transmitted on wire** (verified by annotation size arithmetic for all scenarios).
@@ -1162,9 +1227,13 @@ The following claims are verified as **universal invariants** over all 38 benchm
 | Geometric mean compression vs JSON-LD | 79.8% |
 | Best case | 85.4% (minimal document, Tier 2, 8-bit) |
 | Worst case | 72.1% (medium document, Tier 1, 32-bit) |
-| Tier 1 annotation overhead | 4 bytes (8-bit) to 13 bytes (32-bit) |
-| Annotation bit efficiency (Tier 1, 8-bit) | 93.0% |
-| Annotation ratio: JSON-LD / CBOR-LD-ex | ~37× |
+| Tier 1 annotation overhead (full) | 4 bytes (8-bit) to 13 bytes (32-bit) |
+| Tier 1 annotation overhead (delta) | **3 bytes** |
+| Annotation bit efficiency (Tier 1, 8-bit full) | **94.3%** |
+| Annotation bit efficiency (Tier 1, 8-bit delta) | **96.5%** |
+| Header bit efficiency | **89.6%** |
+| precision_mode utilization | **100%** (4/4 states) |
+| Annotation ratio: JSON-LD / CBOR-LD-ex | ~37× (full), ~93× (delta) |
 | Annotation ratio: CBOR-LD / CBOR-LD-ex | ~10× |
 
 ---
@@ -1188,15 +1257,15 @@ The following claims are verified as **universal invariants** over all 38 benchm
 
 ## Appendix B: Precision Mode Quick Reference
 
-The wire format transmits 3 values (b̂, d̂, â); û is derived by the decoder.
+The wire format transmits 3 values (b̂, d̂, â) for modes 00–10; û is derived by the decoder. Mode 11 (delta) transmits 2 values (Δb̂, Δd̂); â and û are derived from state.
 
 ```
-Bits  Mode   Binomial wire   Multinomial (k=4)  Use case
-────────────────────────────────────────────────────────────
- 8    00     3 bytes         9 bytes             Tier 1 default
-16    01     6 bytes         16 bytes            Tier 2 fusion
-32    10     12 bytes        30 bytes            Tier 3 / audit
- —    11     reserved        reserved            Future use
+Bits  Mode    Code  Binomial wire   Use case
+──────────────────────────────────────────────────────
+ 8    full    00    3 bytes         Tier 1 default / keyframe
+16    full    01    6 bytes         Tier 2 fusion
+32    float   10    12 bytes        Tier 3 / audit
+ 8    delta   11    2 bytes         Time-series streaming (stateful)
 ```
 
 ---
@@ -1265,9 +1334,10 @@ Annotation map key: integer `60000` (3 CBOR bytes), not string `"@annotation"` (
 |---|---|---|
 | JSON-LD text | ~148 bytes (1184 bits) | ~2.5% |
 | CBOR-LD (integer keys, best effort) | ~49 bytes (392 bits) | ~7.6% |
-| **CBOR-LD-ex (bit-packed)** | **4 bytes (32 bits)** | **93.0%** |
+| **CBOR-LD-ex (bit-packed, full)** | **4 bytes (32 bits)** | **94.3%** |
+| **CBOR-LD-ex (bit-packed, delta)** | **3 bytes (24 bits)** | **96.5%** |
 
-CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~37× smaller than JSON-LD.
+CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~37× smaller than JSON-LD (full mode) or ~49× smaller (delta mode).
 
 ---
 
@@ -1285,4 +1355,4 @@ CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~3
 
 ---
 
-*End of document. Next revision will address: §8 (Graph Operations), delta encoding implementation (§7.6), and multinomial wire optimization (§4.4).*
+*End of document. v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), Phase 0 TurboQuant integration (§4.6–4.9), and multinomial wire optimization (§4.4).*
