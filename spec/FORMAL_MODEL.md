@@ -1,9 +1,9 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.4.2-draft  
+**Version:** 0.4.3-draft  
 **Date:** 2026-03-27  
 **Authors:** Muntaser Syed  
-**Status:** Working Draft — Fifth review round fixes applied (v0.4.1 → v0.4.2)  
+**Status:** Working Draft — Sixth review round fixes applied (v0.4.2 → v0.4.3)  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
 **Target Venue:** IETF 125 Hackathon, March 14–15 2026  
 
@@ -377,10 +377,13 @@ Step 3: Compute the fractional parts of each pre-rounding value:
 
 Step 4: IF excess > 0 (over-budget — need to subtract):
           Sort components by frac[i] DESCENDING (largest roundup first).
+          Tie-breaker: if frac[i] == frac[j], the component with LOWER index
+          is prioritized. The uncertainty component û has index k+1.
           Decrement the top `excess` components by 1, each at most once.
 
         IF excess < 0 (under-budget — need to add):
           Sort components by frac[i] ASCENDING (largest rounddown first).
+          Tie-breaker: same lower-index-first rule.
           Increment the top |excess| components by 1, each at most once.
 
 Step 5: Assign: b̂ᵢ = v[i] for i=1..k, û = v[k+1].
@@ -870,6 +873,8 @@ The receiver reconstructs: `b̂_new = b̂_prev + Δb̂`, `d̂_new = d̂_prev + �
 **Savings:** Delta encoding reduces the opinion payload from 3 bytes (full) to 2 bytes (delta) when changes are small. For a sensor reporting every 5 seconds with slowly-changing conditions, this halves the annotation bandwidth.
 
 **Keyframe-first mandate:** A Tier 1 device MUST NOT transmit a delta opinion (`precision_mode = 11`) unless it has previously transmitted at least one full opinion (`precision_mode = 00`, `01`, or `10`) within the current session or connection. The first message after device boot, power cycle, or network join MUST be a full opinion to establish the baseline state (b̂_prev, d̂_prev, â) at the receiver. A receiver that receives a delta opinion without a prior baseline MUST discard it and request a full opinion retransmission.
+
+**Binomial-only restriction:** Delta mode (`precision_mode = 11`) is structurally defined ONLY for binomial opinions. Encoders MUST NOT set `precision_mode = 11` when `has_multinomial = 1`. The delta payload is a fixed 2 bytes (Δb̂, Δd̂), which cannot represent variable-length multinomial deltas. A parser encountering `precision_mode = 11` with `has_multinomial = 1` MUST reject the annotation block as malformed.
 
 **Limitation:** Delta encoding requires stateful receivers (they must track the previous opinion). Stateless receivers or receivers that missed a message MUST fall back to full opinion encoding. The protocol handles this via periodic full-opinion "keyframes" — every Nth message carries the full opinion regardless of change.
 
@@ -1397,4 +1402,4 @@ CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~3
 
 ---
 
-*End of document. v0.4.2 changes: integer simplex projection replaces broken iterative clamping for multinomial (§4.4 Theorem 3c, Definition 11), keyframe-first mandate for delta cold start (§7.6). v0.4.1 changes: delta-to-full fallback on range overflow (§7.6), trust_precision_mode field in trust_info block (§5.1), symmetric clamping mandate for temporal decay and expiry trigger outputs (§7.1). v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), Phase 0 TurboQuant integration (§4.6–4.9).*
+*End of document. v0.4.3 changes: deterministic lower-index tie-breaker for multinomial simplex projection sort (§4.4 Theorem 3c), delta-multinomial ban — precision_mode=11 MUST NOT combine with has_multinomial=1 (§7.6). v0.4.2 changes: integer simplex projection replaces broken iterative clamping for multinomial (§4.4 Theorem 3c, Definition 11), keyframe-first mandate for delta cold start (§7.6). v0.4.1 changes: delta-to-full fallback on range overflow (§7.6), trust_precision_mode field in trust_info block (§5.1), symmetric clamping mandate for temporal decay and expiry trigger outputs (§7.1). v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), Phase 0 TurboQuant integration (§4.6–4.9).*
