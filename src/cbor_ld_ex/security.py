@@ -56,6 +56,11 @@ PROVENANCE_ENTRY_SIZE = 16  # 128 bits, zero waste
 # Chain origin sentinel: 8 zero bytes as prev_digest for the first entry
 CHAIN_ORIGIN_SENTINEL = b"\x00" * DIGEST_SIZE_BYTES
 
+# Audit-grade (Definition 27b): 128-bit digest, 24-byte entries
+AUDIT_DIGEST_SIZE_BYTES = 16  # 128 bits
+AUDIT_ENTRY_SIZE = 24         # 8 (header+opinion+timestamp) + 16 (digest)
+AUDIT_CHAIN_ORIGIN_SENTINEL = b"\x00" * AUDIT_DIGEST_SIZE_BYTES
+
 
 # =====================================================================
 # Annotation Digest
@@ -189,28 +194,33 @@ class ProvenanceEntry:
     prev_digest: bytes    # 64 bits
 
 
-def compute_entry_digest(entry_bytes: bytes) -> bytes:
+def compute_entry_digest(entry_bytes: bytes, audit_grade: bool = False) -> bytes:
     """Compute the chained digest for a provenance entry.
 
-    Uses the same truncated SHA-256 as annotation digests.
-
     Args:
-        entry_bytes: 16-byte serialized provenance entry.
+        entry_bytes: Serialized provenance entry (16 or 24 bytes).
+        audit_grade: If True, return 128-bit (16-byte) digest.
+                     If False, return 64-bit (8-byte) digest.
 
     Returns:
-        8-byte truncated SHA-256 digest.
+        Truncated SHA-256 digest (8 or 16 bytes).
     """
-    return hashlib.sha256(entry_bytes).digest()[:DIGEST_SIZE_BYTES]
+    size = AUDIT_DIGEST_SIZE_BYTES if audit_grade else DIGEST_SIZE_BYTES
+    return hashlib.sha256(entry_bytes).digest()[:size]
 
 
-def encode_provenance_entry(entry: ProvenanceEntry) -> bytes:
-    """Encode a provenance entry to exactly 16 bytes.
+def encode_provenance_entry(entry: ProvenanceEntry, audit_grade: bool = False) -> bytes:
+    """Encode a provenance entry to bytes.
 
-    Byte 0: [origin_tier:2][operator_id:4][precision_mode:2]
-    Bytes 1-3: b̂, d̂, â
-    Bytes 4-7: timestamp (uint32 big-endian)
-    Bytes 8-15: prev_digest
+    Standard (16 bytes):
+      Byte 0: [origin_tier:2][operator_id:4][precision_mode:2]
+      Bytes 1-3: b̂, d̂, â
+      Bytes 4-7: timestamp (uint32 big-endian)
+      Bytes 8-15: prev_digest (64-bit)
+
+    Audit-grade (24 bytes): same layout, bytes 8-23: prev_digest (128-bit).
     """
+    digest_size = AUDIT_DIGEST_SIZE_BYTES if audit_grade else DIGEST_SIZE_BYTES
     byte0 = (
         (entry.origin_tier & 0x03) << 6
         | (entry.operator_id & 0x0F) << 2
@@ -220,12 +230,16 @@ def encode_provenance_entry(entry: ProvenanceEntry) -> bytes:
     return (
         bytes([byte0, entry.b_q & 0xFF, entry.d_q & 0xFF, entry.a_q & 0xFF])
         + struct.pack(">I", entry.timestamp & 0xFFFFFFFF)
-        + entry.prev_digest[:DIGEST_SIZE_BYTES]
+        + entry.prev_digest[:digest_size]
     )
 
 
-def decode_provenance_entry(data: bytes) -> ProvenanceEntry:
-    """Decode 16 bytes to a provenance entry."""
+def decode_provenance_entry(data: bytes, audit_grade: bool = False) -> ProvenanceEntry:
+    """Decode bytes to a provenance entry.
+
+    Standard: 16 bytes (64-bit digest). Audit-grade: 24 bytes (128-bit digest).
+    """
+    digest_size = AUDIT_DIGEST_SIZE_BYTES if audit_grade else DIGEST_SIZE_BYTES
     byte0 = data[0]
     origin_tier = (byte0 >> 6) & 0x03
     operator_id = (byte0 >> 2) & 0x0F
@@ -236,7 +250,7 @@ def decode_provenance_entry(data: bytes) -> ProvenanceEntry:
     a_q = data[3]
 
     timestamp = struct.unpack(">I", data[4:8])[0]
-    prev_digest = data[8:16]
+    prev_digest = data[8:8 + digest_size]
 
     return ProvenanceEntry(
         origin_tier=origin_tier,
@@ -263,54 +277,59 @@ def decode_provenance_entry(data: bytes) -> ProvenanceEntry:
 #      of the previous entry's serialized form
 # =====================================================================
 
-def encode_provenance_chain(entries: list[ProvenanceEntry]) -> bytes:
+def encode_provenance_chain(entries: list[ProvenanceEntry], audit_grade: bool = False) -> bytes:
     """Encode a provenance chain to bytes.
 
     Args:
         entries: Ordered list of provenance entries.
+        audit_grade: If True, use 24-byte entries with 128-bit digests.
 
     Returns:
-        Concatenated entry bytes (16 bytes per entry).
+        Concatenated entry bytes (16 or 24 bytes per entry).
     """
-    return b"".join(encode_provenance_entry(e) for e in entries)
+    return b"".join(encode_provenance_entry(e, audit_grade=audit_grade) for e in entries)
 
 
-def decode_provenance_chain(data: bytes, count: int) -> list[ProvenanceEntry]:
+def decode_provenance_chain(data: bytes, count: int, audit_grade: bool = False) -> list[ProvenanceEntry]:
     """Decode bytes to a list of provenance entries.
 
     Args:
-        data: Raw bytes (must be count × 16 bytes).
+        data: Raw bytes (must be count × entry_size bytes).
         count: Number of entries to decode.
+        audit_grade: If True, entries are 24 bytes each.
 
     Returns:
         List of ProvenanceEntry objects.
 
     Raises:
-        ValueError: If data length doesn't match count × 16.
+        ValueError: If data length doesn't match count × entry_size.
     """
-    expected = count * PROVENANCE_ENTRY_SIZE
+    entry_size = AUDIT_ENTRY_SIZE if audit_grade else PROVENANCE_ENTRY_SIZE
+    expected = count * entry_size
     if len(data) != expected:
         raise ValueError(
             f"Expected {expected} bytes for {count} entries, got {len(data)}"
         )
     return [
-        decode_provenance_entry(data[i * PROVENANCE_ENTRY_SIZE:(i + 1) * PROVENANCE_ENTRY_SIZE])
+        decode_provenance_entry(data[i * entry_size:(i + 1) * entry_size], audit_grade=audit_grade)
         for i in range(count)
     ]
 
 
 def verify_provenance_chain(
     entries: list[ProvenanceEntry],
+    audit_grade: bool = False,
 ) -> tuple[bool, int]:
     """Verify the integrity of a provenance chain.
 
     Checks:
-      1. First entry has CHAIN_ORIGIN_SENTINEL as prev_digest.
+      1. First entry has the correct sentinel (8 or 16 zero bytes).
       2. Each subsequent entry's prev_digest matches the truncated
          SHA-256 of the previous entry's serialized bytes.
 
     Args:
         entries: Ordered list of provenance entries.
+        audit_grade: If True, expect 128-bit digests and 16-byte sentinel.
 
     Returns:
         (is_valid, error_index) where:
@@ -320,14 +339,15 @@ def verify_provenance_chain(
     if not entries:
         return (True, -1)
 
-    # Check 1: first entry must have sentinel
-    if entries[0].prev_digest != CHAIN_ORIGIN_SENTINEL:
+    # Check 1: first entry must have correct sentinel
+    sentinel = AUDIT_CHAIN_ORIGIN_SENTINEL if audit_grade else CHAIN_ORIGIN_SENTINEL
+    if entries[0].prev_digest != sentinel:
         return (False, 0)
 
     # Check 2: chained digests
     for i in range(1, len(entries)):
-        prev_bytes = encode_provenance_entry(entries[i - 1])
-        expected_digest = compute_entry_digest(prev_bytes)
+        prev_bytes = encode_provenance_entry(entries[i - 1], audit_grade=audit_grade)
+        expected_digest = compute_entry_digest(prev_bytes, audit_grade=audit_grade)
         if entries[i].prev_digest != expected_digest:
             return (False, i)
 

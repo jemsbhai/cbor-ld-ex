@@ -63,6 +63,10 @@ from cbor_ld_ex.security import (
     decode_provenance_chain,
     verify_provenance_chain,
     compute_entry_digest,
+    # Audit-grade (24-byte) entries
+    AUDIT_DIGEST_SIZE_BYTES,
+    AUDIT_ENTRY_SIZE,
+    AUDIT_CHAIN_ORIGIN_SENTINEL,
 )
 
 # Reference for cross-validation
@@ -770,3 +774,214 @@ class TestSecurityIntegration:
         assert recovered.a_q == a_q
         # û can be derived
         assert b_q + d_q + (255 - b_q - d_q) == 255
+
+
+# =========================================================================
+# 7. Audit-grade provenance entries — 24 bytes, 128-bit digest (§9.4)
+# =========================================================================
+
+class TestAuditGradeConstants:
+    """Audit-grade constants per Definition 27b."""
+
+    def test_audit_digest_size(self):
+        """128-bit digest = 16 bytes."""
+        assert AUDIT_DIGEST_SIZE_BYTES == 16
+
+    def test_audit_entry_size(self):
+        """24 bytes = 8 (header+opinion+timestamp) + 16 (digest)."""
+        assert AUDIT_ENTRY_SIZE == 24
+
+    def test_audit_sentinel_size(self):
+        """Audit sentinel is 16 zero bytes."""
+        assert AUDIT_CHAIN_ORIGIN_SENTINEL == b"\x00" * 16
+        assert len(AUDIT_CHAIN_ORIGIN_SENTINEL) == 16
+
+
+class TestAuditGradeEntry:
+    """Audit-grade 24-byte provenance entries (Definition 27b)."""
+
+    def test_encode_size_exactly_24_bytes(self):
+        """Audit-grade entry is exactly 24 bytes."""
+        entry = ProvenanceEntry(
+            origin_tier=2, operator_id=1, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        data = encode_provenance_entry(entry, audit_grade=True)
+        assert len(data) == 24
+
+    def test_encode_decode_roundtrip(self):
+        """Full roundtrip: encode → decode → same entry."""
+        entry = ProvenanceEntry(
+            origin_tier=2, operator_id=5, precision_mode=0,
+            b_q=180, d_q=40, a_q=100,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        data = encode_provenance_entry(entry, audit_grade=True)
+        recovered = decode_provenance_entry(data, audit_grade=True)
+
+        assert recovered.origin_tier == 2
+        assert recovered.operator_id == 5
+        assert recovered.precision_mode == 0
+        assert recovered.b_q == 180
+        assert recovered.d_q == 40
+        assert recovered.a_q == 100
+        assert recovered.timestamp == 1710230400
+        assert recovered.prev_digest == AUDIT_CHAIN_ORIGIN_SENTINEL
+        assert len(recovered.prev_digest) == 16
+
+    def test_first_8_bytes_identical_to_standard(self):
+        """Bytes 0–7 are identical between standard and audit-grade.
+
+        Only the digest portion (bytes 8+) differs in size.
+        """
+        entry = ProvenanceEntry(
+            origin_tier=1, operator_id=7, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+        )
+        entry_audit = ProvenanceEntry(
+            origin_tier=1, operator_id=7, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        std_data = encode_provenance_entry(entry, audit_grade=False)
+        aud_data = encode_provenance_entry(entry_audit, audit_grade=True)
+
+        assert std_data[:8] == aud_data[:8]
+
+    def test_audit_digest_is_128_bit_sha256(self):
+        """Audit entry digest is first 16 bytes of SHA-256."""
+        entry = ProvenanceEntry(
+            origin_tier=2, operator_id=1, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        entry_bytes = encode_provenance_entry(entry, audit_grade=True)
+        digest = compute_entry_digest(entry_bytes, audit_grade=True)
+        assert len(digest) == 16
+
+        # Must match first 16 bytes of SHA-256
+        expected = hashlib.sha256(entry_bytes).digest()[:16]
+        assert digest == expected
+
+
+class TestAuditGradeChain:
+    """Audit-grade provenance chain: chained 128-bit digests."""
+
+    def test_chain_encode_decode_roundtrip(self):
+        """Encode → decode roundtrip for audit-grade chain."""
+        e1 = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        e1_bytes = encode_provenance_entry(e1, audit_grade=True)
+        e1_digest = compute_entry_digest(e1_bytes, audit_grade=True)
+
+        e2 = ProvenanceEntry(
+            origin_tier=1, operator_id=1, precision_mode=0,
+            b_q=190, d_q=35, a_q=128,
+            timestamp=1710230410,
+            prev_digest=e1_digest,
+        )
+
+        chain_bytes = encode_provenance_chain([e1, e2], audit_grade=True)
+        assert len(chain_bytes) == 48  # 2 × 24
+
+        recovered = decode_provenance_chain(chain_bytes, count=2, audit_grade=True)
+        assert len(recovered) == 2
+        assert recovered[0].b_q == 200
+        assert recovered[1].b_q == 190
+        assert len(recovered[1].prev_digest) == 16
+
+    def test_chain_verify_valid(self):
+        """Valid audit-grade chain passes verification."""
+        e1 = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        e1_bytes = encode_provenance_entry(e1, audit_grade=True)
+        e1_digest = compute_entry_digest(e1_bytes, audit_grade=True)
+
+        e2 = ProvenanceEntry(
+            origin_tier=1, operator_id=1, precision_mode=0,
+            b_q=190, d_q=35, a_q=128,
+            timestamp=1710230410,
+            prev_digest=e1_digest,
+        )
+
+        is_valid, err_idx = verify_provenance_chain([e1, e2], audit_grade=True)
+        assert is_valid is True
+        assert err_idx == -1
+
+    def test_chain_verify_detects_tamper(self):
+        """Modifying an audit-grade entry invalidates the chain."""
+        e1 = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+        e1_bytes = encode_provenance_entry(e1, audit_grade=True)
+        e1_digest = compute_entry_digest(e1_bytes, audit_grade=True)
+
+        e2 = ProvenanceEntry(
+            origin_tier=1, operator_id=1, precision_mode=0,
+            b_q=190, d_q=35, a_q=128,
+            timestamp=1710230410,
+            prev_digest=e1_digest,
+        )
+
+        # Tamper with e1
+        e1.b_q = 199
+        is_valid, err_idx = verify_provenance_chain([e1, e2], audit_grade=True)
+        assert is_valid is False
+        assert err_idx == 1
+
+    def test_chain_verify_detects_wrong_sentinel(self):
+        """Audit chain must use 16-byte sentinel, not 8-byte."""
+        e1 = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,  # wrong: 8 bytes
+        )
+        is_valid, err_idx = verify_provenance_chain([e1], audit_grade=True)
+        assert is_valid is False
+        assert err_idx == 0
+
+    def test_standard_and_audit_chains_independent(self):
+        """Standard and audit chains for same data produce different digests."""
+        entry = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+        )
+        entry_audit = ProvenanceEntry(
+            origin_tier=1, operator_id=0, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+        )
+
+        std_bytes = encode_provenance_entry(entry, audit_grade=False)
+        aud_bytes = encode_provenance_entry(entry_audit, audit_grade=True)
+
+        std_digest = compute_entry_digest(std_bytes, audit_grade=False)
+        aud_digest = compute_entry_digest(aud_bytes, audit_grade=True)
+
+        # Different sizes
+        assert len(std_digest) == 8
+        assert len(aud_digest) == 16
+        # Different content (different input bytes due to different sentinel size)
+        assert std_digest != aud_digest[:8]
