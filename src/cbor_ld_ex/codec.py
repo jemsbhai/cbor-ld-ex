@@ -48,6 +48,11 @@ from cbor_ld_ex.headers import (
     PrecisionMode,
 )
 from cbor_ld_ex.opinions import dequantize_binomial
+from cbor_ld_ex.security import (
+    ProvenanceEntry,
+    PROVENANCE_ENTRY_SIZE,
+    AUDIT_ENTRY_SIZE,
+)
 
 
 # =====================================================================
@@ -404,6 +409,104 @@ def annotation_information_bits(annotation: Annotation) -> dict:
         "bit_efficiency": (
             total_info_bits / total_wire_bits
             if total_wire_bits > 0 else 0.0
+        ),
+    }
+
+
+# =====================================================================
+# Provenance Block Shannon Analysis — §4.7.5, §9.4, §11
+# =====================================================================
+
+# Provenance entry field state counts — every number must be justified.
+# These reuse the annotation-level constants where fields overlap.
+_PROV_PRECISION_BIT_HIGH_STATES = 1  # Always 0 for provenance (§9.4): DEAD BIT
+_PROV_HAS_CORRECTION_STATES = 2     # §4.7.5: 0 or 1
+_PROV_TIMESTAMP_BITS = 32            # uint32, full range
+_PROV_DIGEST_BITS_STANDARD = 64      # 64-bit truncated SHA-256
+_PROV_DIGEST_BITS_AUDIT = 128        # 128-bit audit-grade
+_PROV_CORRECTION_BITS_PER_ENTRY = 3  # c_b, c_d, c_a
+_PROV_CHAIN_LENGTH_STATES = 256      # uint8
+
+
+def provenance_block_information_bits(
+    entries: list[ProvenanceEntry],
+    audit_grade: bool = False,
+) -> dict:
+    """Shannon information analysis of a provenance block (§4.7.5, §9.4).
+
+    Computes per-entry and block-level information content, wire cost,
+    and bit efficiency. Accounts for the correction block overhead
+    including byte-boundary padding waste.
+
+    Every field is accounted for. Every bit of waste is identified.
+
+    Args:
+        entries: List of ProvenanceEntry objects.
+        audit_grade: If True, use 24-byte (192-bit) entry layout.
+
+    Returns:
+        Dict with per-field breakdown, per-entry totals, correction
+        block accounting, and overall block efficiency.
+    """
+    entry_size = AUDIT_ENTRY_SIZE if audit_grade else PROVENANCE_ENTRY_SIZE
+    entry_wire_bits = entry_size * 8
+    digest_bits = _PROV_DIGEST_BITS_AUDIT if audit_grade else _PROV_DIGEST_BITS_STANDARD
+
+    # ── Per-entry field breakdown ───────────────────────────────────
+    fields = {}
+    fields["origin_tier"] = _log2_safe(_ORIGIN_TIER_STATES)
+    fields["operator_id"] = _log2_safe(_OPERATOR_ID_STATES)
+    fields["precision_bit_high"] = 0.0  # Dead bit: 1 state → 0 info bits
+    fields["has_correction"] = _log2_safe(_PROV_HAS_CORRECTION_STATES)
+
+    # Opinion: provenance always 8-bit (§9.4). Same constraint as annotation.
+    max_val_8 = 255
+    valid_bd_pairs = (max_val_8 + 1) * (max_val_8 + 2) // 2  # 32896
+    fields["opinion_bd"] = _log2_safe(valid_bd_pairs)
+    fields["opinion_a"] = _log2_safe(max_val_8 + 1)  # 256 states
+
+    fields["timestamp"] = float(_PROV_TIMESTAMP_BITS)
+    fields["prev_digest"] = float(digest_bits)
+
+    per_entry_info = sum(fields.values())
+
+    # ── Chain length field ────────────────────────────────────────
+    chain_length_info = _log2_safe(_PROV_CHAIN_LENGTH_STATES)  # 8.0
+    chain_length_wire = 8  # 1 byte
+
+    # ── Correction block ──────────────────────────────────────
+    num_corrected = sum(1 for e in entries if e.has_correction)
+    correction_info_bits = num_corrected * _PROV_CORRECTION_BITS_PER_ENTRY
+    if correction_info_bits > 0:
+        # Pad to byte boundary: ceil(info_bits / 8) * 8
+        correction_wire_bits = ((correction_info_bits + 7) // 8) * 8
+    else:
+        correction_wire_bits = 0
+    correction_pad_bits = correction_wire_bits - correction_info_bits
+
+    # ── Totals ──────────────────────────────────────────────
+    n = len(entries)
+    total_info = chain_length_info + n * per_entry_info + correction_info_bits
+    total_wire = chain_length_wire + n * entry_wire_bits + correction_wire_bits
+
+    return {
+        "fields": fields,
+        "per_entry_info_bits": per_entry_info,
+        "per_entry_wire_bits": entry_wire_bits,
+        "per_entry_efficiency": (
+            per_entry_info / entry_wire_bits if entry_wire_bits > 0 else 0.0
+        ),
+        "chain_length_info_bits": chain_length_info,
+        "chain_length_wire_bits": chain_length_wire,
+        "num_entries": n,
+        "num_corrected": num_corrected,
+        "correction_info_bits": correction_info_bits,
+        "correction_wire_bits": correction_wire_bits,
+        "correction_pad_bits": correction_pad_bits,
+        "total_info_bits": total_info,
+        "total_wire_bits": total_wire,
+        "bit_efficiency": (
+            total_info / total_wire if total_wire > 0 else 0.0
         ),
     }
 

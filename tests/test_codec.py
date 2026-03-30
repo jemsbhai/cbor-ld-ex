@@ -47,8 +47,16 @@ from cbor_ld_ex.codec import (
     decode,
     payload_comparison,
     annotation_information_bits,
+    provenance_block_information_bits,
     ContextRegistry,
     ANNOTATION_TERM_ID,
+)
+from cbor_ld_ex.security import (
+    ProvenanceEntry,
+    CHAIN_ORIGIN_SENTINEL,
+    AUDIT_CHAIN_ORIGIN_SENTINEL,
+    encode_provenance_entry,
+    compute_entry_digest,
 )
 
 # SL algebra from the parent library — the published reference implementation
@@ -1734,3 +1742,220 @@ class TestDeltaStreamIntegration:
         assert doc_out["unit"] == "Celsius"
         assert r.reconstructed == (205, 27, 23, 128)
         assert r.reconstructed[0] + r.reconstructed[1] + r.reconstructed[2] == 255
+
+
+# ===========================================================================
+# §4.7.5 + §11: Provenance Block Shannon Analysis
+# ===========================================================================
+
+class TestProvenanceBlockInformationBits:
+    """Shannon information analysis for provenance blocks with correction.
+
+    Per-entry bit layout (16 bytes = 128 wire bits, standard):
+      Byte 0: [origin_tier:2][operator_id:4][precision_bit_high:1][has_correction:1]
+      Bytes 1-3: b̂, d̂, â (opinion, always 8-bit for provenance per §9.4)
+      Bytes 4-7: timestamp (uint32)
+      Bytes 8-15: prev_digest (64-bit)
+
+    Shannon information per entry (standard):
+      origin_tier:       log₂(3)     = 1.585 bits
+      operator_id:       log₂(13)    = 3.700 bits
+      precision_bit_high: log₂(1)    = 0.000 bits (dead bit, always 0)
+      has_correction:    log₂(2)     = 1.000 bits
+      opinion(b̂,d̂):    log₂(32896) = 15.006 bits (b̂+d̂≤255 constraint)
+      â:                 log₂(256)   = 8.000 bits
+      timestamp:         log₂(2³²)   = 32.000 bits
+      prev_digest:       log₂(2⁶⁴)   = 64.000 bits
+      TOTAL:                          125.291 bits in 128 wire bits = 97.88%
+
+    Waste breakdown: 2.709 bits total
+      - origin_tier non-power-of-2:     0.415 bits
+      - operator_id non-power-of-2:     0.300 bits
+      - precision_bit_high dead bit:    1.000 bits
+      - opinion constraint residual:    0.994 bits
+    """
+
+    def _make_chain(self, length, corrected_indices=None, audit_grade=False):
+        """Build a valid provenance chain."""
+        sentinel = AUDIT_CHAIN_ORIGIN_SENTINEL if audit_grade else CHAIN_ORIGIN_SENTINEL
+        entries = []
+        prev = sentinel
+        for i in range(length):
+            has_corr = i in (corrected_indices or set())
+            e = ProvenanceEntry(
+                origin_tier=1, operator_id=i % 13, precision_mode=0,
+                b_q=200 - i, d_q=30 + i, a_q=128,
+                timestamp=1710230400 + i,
+                prev_digest=prev,
+                has_correction=has_corr,
+                c_b=1 if has_corr else 0,
+                c_d=0,
+                c_a=1 if has_corr else 0,
+            )
+            entry_bytes = encode_provenance_entry(e, audit_grade=audit_grade)
+            prev = compute_entry_digest(entry_bytes, audit_grade=audit_grade)
+            entries.append(e)
+        return entries
+
+    def test_per_entry_info_standard(self):
+        """Per-entry Shannon info = 125.291 bits in 128 wire bits."""
+        entries = self._make_chain(1)
+        result = provenance_block_information_bits(entries)
+        expected_entry_info = (
+            math.log2(3)      # origin_tier
+            + math.log2(13)   # operator_id
+            + 0.0             # precision_bit_high (dead)
+            + math.log2(2)    # has_correction
+            + math.log2(256 * 257 // 2)  # opinion (b̂,d̂) constrained
+            + math.log2(256)  # â
+            + 32.0            # timestamp
+            + 64.0            # prev_digest
+        )
+        assert math.isclose(
+            result["per_entry_info_bits"], expected_entry_info, rel_tol=1e-9
+        )
+        assert result["per_entry_wire_bits"] == 128
+        assert math.isclose(
+            result["per_entry_efficiency"],
+            expected_entry_info / 128,
+            rel_tol=1e-9,
+        )
+
+    def test_per_entry_info_audit_grade(self):
+        """Audit-grade: 189.291 bits in 192 wire bits = 98.59%."""
+        entries = self._make_chain(1, audit_grade=True)
+        result = provenance_block_information_bits(entries, audit_grade=True)
+        expected_entry_info = (
+            math.log2(3) + math.log2(13) + 0.0 + math.log2(2)
+            + math.log2(256 * 257 // 2) + math.log2(256)
+            + 32.0 + 128.0  # 128-bit digest
+        )
+        assert math.isclose(
+            result["per_entry_info_bits"], expected_entry_info, rel_tol=1e-9
+        )
+        assert result["per_entry_wire_bits"] == 192
+        assert result["per_entry_efficiency"] > 0.985
+
+    def test_no_correction_zero_overhead(self):
+        """Chain with no corrections: correction overhead is exactly 0."""
+        entries = self._make_chain(5)
+        result = provenance_block_information_bits(entries)
+        assert result["num_corrected"] == 0
+        assert result["correction_info_bits"] == 0
+        assert result["correction_wire_bits"] == 0
+        assert result["correction_pad_bits"] == 0
+
+    def test_all_corrected_L10_overhead_matches_spec(self):
+        """§4.7.5 Table: L=10 all corrected → +2.5% overhead.
+
+        10 × 3 = 30 correction bits → ceil(30/8)*8 = 32 wire bits.
+        Correction info: 30 bits. Correction wire: 32 bits. Pad: 2 bits.
+        Block wire baseline (no corrections): 8 + 10*128 = 1288 bits.
+        With corrections: 1288 + 32 = 1320 bits.
+        Overhead: 32/1288 = 2.48%.
+        """
+        entries = self._make_chain(10, corrected_indices=set(range(10)))
+        result = provenance_block_information_bits(entries)
+        assert result["num_corrected"] == 10
+        assert result["correction_info_bits"] == 30
+        assert result["correction_wire_bits"] == 32
+        assert result["correction_pad_bits"] == 2
+        # Overhead percentage
+        baseline_wire = 8 + 10 * 128  # chain_length + entries
+        overhead_pct = result["correction_wire_bits"] / baseline_wire * 100
+        assert abs(overhead_pct - 2.48) < 0.1
+
+    def test_mixed_corrections_pad_accounting(self):
+        """Mixed: 3 corrected of 5 → 9 bits → 16 wire → 7 pad bits."""
+        entries = self._make_chain(5, corrected_indices={0, 2, 4})
+        result = provenance_block_information_bits(entries)
+        assert result["num_corrected"] == 3
+        assert result["correction_info_bits"] == 9
+        assert result["correction_wire_bits"] == 16  # ceil(9/8)*8
+        assert result["correction_pad_bits"] == 7
+
+    def test_single_correction_worst_case_pad(self):
+        """1 corrected entry: 3 info bits in 8 wire bits = 5 pad bits.
+
+        This is the worst case for correction block padding.
+        """
+        entries = self._make_chain(3, corrected_indices={1})
+        result = provenance_block_information_bits(entries)
+        assert result["correction_info_bits"] == 3
+        assert result["correction_wire_bits"] == 8
+        assert result["correction_pad_bits"] == 5
+
+    def test_eight_corrections_zero_pad(self):
+        """8 corrected entries: 24 bits → 24 wire bits → 0 pad. Perfect."""
+        entries = self._make_chain(8, corrected_indices=set(range(8)))
+        result = provenance_block_information_bits(entries)
+        assert result["correction_info_bits"] == 24
+        assert result["correction_wire_bits"] == 24
+        assert result["correction_pad_bits"] == 0
+
+    def test_total_bits_sum_correctly(self):
+        """Total = chain_length + entries + correction. No hidden overhead."""
+        entries = self._make_chain(5, corrected_indices={1, 3})
+        result = provenance_block_information_bits(entries)
+        expected_total_info = (
+            result["chain_length_info_bits"]
+            + 5 * result["per_entry_info_bits"]
+            + result["correction_info_bits"]
+        )
+        expected_total_wire = (
+            result["chain_length_wire_bits"]
+            + 5 * result["per_entry_wire_bits"]
+            + result["correction_wire_bits"]
+        )
+        assert math.isclose(
+            result["total_info_bits"], expected_total_info, rel_tol=1e-12
+        )
+        assert result["total_wire_bits"] == expected_total_wire
+        assert math.isclose(
+            result["bit_efficiency"],
+            expected_total_info / expected_total_wire,
+            rel_tol=1e-12,
+        )
+
+    def test_chain_length_field_perfect_efficiency(self):
+        """chain_length is uint8: 256 states in 8 bits = 100% efficient."""
+        entries = self._make_chain(3)
+        result = provenance_block_information_bits(entries)
+        assert result["chain_length_info_bits"] == 8.0
+        assert result["chain_length_wire_bits"] == 8
+
+    def test_precision_bit_high_waste_accounted(self):
+        """precision_bit_high carries 0 info — must appear in fields breakdown."""
+        entries = self._make_chain(1)
+        result = provenance_block_information_bits(entries)
+        assert result["fields"]["precision_bit_high"] == 0.0
+        # It costs 1 wire bit but carries 0 info
+        total_byte0_info = (
+            result["fields"]["origin_tier"]
+            + result["fields"]["operator_id"]
+            + result["fields"]["precision_bit_high"]
+            + result["fields"]["has_correction"]
+        )
+        assert total_byte0_info < 8.0  # byte 0 is not perfectly packed
+        assert result["fields"]["has_correction"] == 1.0  # but this bit earns its keep
+
+    def test_empty_chain(self):
+        """Empty chain: only chain_length byte."""
+        result = provenance_block_information_bits([])
+        assert result["total_info_bits"] == 8.0  # chain_length only
+        assert result["total_wire_bits"] == 8
+        assert result["bit_efficiency"] == 1.0
+        assert result["num_corrected"] == 0
+
+    def test_standard_entry_efficiency_above_97(self):
+        """Standard provenance entry: >97% bit efficiency.
+
+        125.291 / 128 = 97.88%. Every field earns its space.
+        The 2.709 bits of waste are from non-power-of-2 state counts
+        and the dead precision_bit_high — unavoidable given the byte 0 layout.
+        """
+        entries = self._make_chain(1)
+        result = provenance_block_information_bits(entries)
+        assert result["per_entry_efficiency"] > 0.97
+        # Total block efficiency (includes chain_length)
+        assert result["bit_efficiency"] > 0.97
