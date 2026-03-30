@@ -215,20 +215,49 @@ class TestClampingEdgeCases:
         assert u_q == 0
         assert b_q + d_q + u_q == 255
 
-    def test_clamping_preserves_belief_bias(self):
-        """Per FORMAL_MODEL.md: clamping decrements d̂, not b̂.
+    def test_symmetric_clamping_tiebreaker_even_a(self):
+        """Symmetric clamping (FORMAL_MODEL.md v0.4.0+ §4.2).
 
-        When clamping fires, b̂ is preserved and d̂ absorbs the correction.
-        This introduces a marginal bias toward belief — documented and intentional.
+        b=0.5, d=0.5, u=0.0: both have frac=0.5, so tiebreaker fires.
+        a=0.5 → â=round(0.5*255)=128, â & 1 == 0 → decrement d̂.
+        Result: b̂=128, d̂=127, û=0.
         """
-        # Find a case where clamping fires: b + d = 1.0 with both rounding up
-        # 0.5, 0.5 at 8-bit is the canonical case
-        b_q, d_q, u_q, _ = quantize_binomial(0.5, 0.5, 0.0, 0.5, precision=8)
+        b_q, d_q, u_q, a_q = quantize_binomial(0.5, 0.5, 0.0, 0.5, precision=8)
 
-        # b̂ should be round(0.5 * 255) = 128, preserved
-        assert b_q == 128, f"Belief was modified during clamping: b̂ = {b_q}"
-        # d̂ should have been decremented
-        assert d_q <= 128, f"Disbelief was not clamped: d̂ = {d_q}"
+        assert b_q == 128, f"b̂ should be 128, got {b_q}"
+        assert d_q == 127, f"d̂ should be 127 (â LSB=0 → decrement d̂), got {d_q}"
+        assert u_q == 0
+        assert b_q + d_q + u_q == 255
+
+    def test_symmetric_clamping_tiebreaker_odd_a(self):
+        """Tiebreaker with odd â: should decrement b̂ instead.
+
+        b=0.5, d=0.5, u=0.0, a=0.49 → â=round(0.49*255)=round(124.95)=125.
+        â & 1 == 1 → decrement b̂.
+        Result: b̂=127, d̂=128, û=0.
+        """
+        b_q, d_q, u_q, a_q = quantize_binomial(0.5, 0.5, 0.0, 0.49, precision=8)
+
+        assert b_q == 127, f"b̂ should be 127 (â LSB=1 → decrement b̂), got {b_q}"
+        assert d_q == 128, f"d̂ should be 128, got {d_q}"
+        assert u_q == 0
+        assert a_q == 125
+        assert b_q + d_q + u_q == 255
+
+    def test_symmetric_clamping_symmetry_property(self):
+        """Swapping b and d must swap the clamping target.
+
+        This is the core symmetry guarantee of §4.2: neither component
+        has structural priority.
+        """
+        # With even â: (0.5, 0.5, 0, 0.5) decrements d̂
+        b1, d1, u1, a1 = quantize_binomial(0.5, 0.5, 0.0, 0.5, precision=8)
+        # With odd â: (0.5, 0.5, 0, 0.49) decrements b̂
+        b2, d2, u2, a2 = quantize_binomial(0.5, 0.5, 0.0, 0.49, precision=8)
+
+        # The two results should be mirror images
+        assert b1 == d2, f"Symmetry broken: b̂(even)={b1} != d̂(odd)={d2}"
+        assert d1 == b2, f"Symmetry broken: d̂(even)={d1} != b̂(odd)={b2}"
 
 
 # ---------------------------------------------------------------------------
@@ -374,14 +403,13 @@ class TestMultinomialQuantization:
             f"Reconstructed sum: {sum(beliefs_r)} + {u_r} = {sum(beliefs_r) + u_r}"
         )
 
-    def test_multinomial_clamping(self):
-        """Edge case where derived k-th belief would go negative.
+    def test_multinomial_integer_simplex_projection(self):
+        """Integer simplex projection (FORMAL_MODEL.md v0.4.2+ §4.4).
 
-        If rounding errors push sum of k-1 quantized beliefs + û > 255,
-        the encoder must clamp (reduce largest b̂_i by 1).
+        All k+1 components quantized independently, excess distributed by
+        fractional-part rank. Replaces the old iterative decrement loop.
         """
-        # Construct a case likely to trigger clamping:
-        # All beliefs close to 1/k, many of them rounding up
+        # All beliefs close to 1/k, many rounding up
         beliefs = [0.25, 0.25, 0.25, 0.25]
         u = 0.0
         base_rates = [0.25, 0.25, 0.25, 0.25]
@@ -390,10 +418,70 @@ class TestMultinomialQuantization:
             beliefs, u, base_rates, precision=8
         )
 
-        # Must hold regardless of clamping
+        # Core constraint: sum = 255
         assert sum(beliefs_q) + u_q == 255
+        # All non-negative
         for b_q in beliefs_q:
-            assert b_q >= 0
+            assert b_q >= 0, f"Negative belief component: {b_q}"
+        assert u_q >= 0
+
+    def test_multinomial_projection_max_adjustment_is_one(self):
+        """Each component adjusted by at most ±1 from independent rounding.
+
+        Property (i) of §4.4 Theorem 3(c): no component is adjusted twice.
+        """
+        beliefs = [0.2, 0.2, 0.2, 0.2, 0.1]
+        u = 0.1
+        base_rates = [0.2, 0.2, 0.2, 0.2, 0.2]
+
+        beliefs_q, u_q, base_rates_q = quantize_multinomial(
+            beliefs, u, base_rates, precision=8
+        )
+
+        # Check each component differs by at most 1 from independent rounding
+        mv = 255
+        for i, (bq, b_orig) in enumerate(zip(beliefs_q, beliefs)):
+            independent = round(b_orig * mv)
+            assert abs(bq - independent) <= 1, (
+                f"beliefs_q[{i}] = {bq}, independent round = {independent}, "
+                f"diff = {abs(bq - independent)} > 1"
+            )
+        u_independent = round(u * mv)
+        assert abs(u_q - u_independent) <= 1, (
+            f"u_q = {u_q}, independent round = {u_independent}, "
+            f"diff = {abs(u_q - u_independent)} > 1"
+        )
+
+    def test_multinomial_projection_lower_index_tiebreaker(self):
+        """When fractional parts are equal, lower index is prioritized.
+
+        Per §4.4 Theorem 3(c): deterministic cross-platform behavior.
+        """
+        # All components have the same fractional part
+        # 0.2 * 255 = 51.0 exactly — no excess, no correction needed
+        # Need a case where equal fracs trigger tiebreaker.
+        # 0.25 * 255 = 63.75 → rounds to 64 each.
+        # 4 beliefs + u=0: 4*64 + 0 = 256 > 255. Excess = 1.
+        # All fracs = 0.75. Tiebreaker: lower index decremented first.
+        beliefs = [0.25, 0.25, 0.25, 0.25]
+        u = 0.0
+        base_rates = [0.25, 0.25, 0.25, 0.25]
+
+        beliefs_q, u_q, _ = quantize_multinomial(
+            beliefs, u, base_rates, precision=8
+        )
+
+        # Excess = 1. All fracs = 0.75, all tied.
+        # Lower-index tiebreaker → index 0 gets decremented first.
+        # Expected: beliefs_q[0] = 63, beliefs_q[1..3] = 64, u_q = 0
+        assert beliefs_q[0] == 63, (
+            f"Lower-index tiebreaker failed: beliefs_q[0] = {beliefs_q[0]}, expected 63"
+        )
+        assert all(beliefs_q[i] == 64 for i in range(1, 4)), (
+            f"Other components modified unexpectedly: {beliefs_q[1:]}"
+        )
+        assert u_q == 0
+        assert sum(beliefs_q) + u_q == 255
 
     def test_multinomial_binary_domain(self):
         """k=2 multinomial should behave like binomial.

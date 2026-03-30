@@ -14,6 +14,7 @@ Precision modes (Table 1, §4.3):
   32-bit (mode 10): 16 bytes (IEEE 754 float32, no quantization)
 """
 
+import math
 import struct
 from typing import Union
 
@@ -74,16 +75,17 @@ def _dequantize_single(k: int, max_val: int) -> float:
 def quantize_binomial(
     b: float, d: float, u: float, a: float, precision: int = 8
 ) -> tuple[int, int, int, int]:
-    """Constrained binomial quantization (Definition 10).
+    """Constrained binomial quantization (Definition 10, §4.2).
 
     Quantizes b and d independently via rounding, then derives
     û = (2^n - 1) - b̂ - d̂. The uncertainty component is NEVER
     independently quantized — this is what preserves b̂ + d̂ + û = 2^n - 1
     exactly (Theorem 1a).
 
-    Clamping rule (Theorem 1c): If b̂ + d̂ > max_val (possible when
-    u ≈ 0 and both b and d round up), d̂ is decremented by 1.
-    This introduces a documented marginal bias toward belief.
+    Symmetric clamping rule (Theorem 1c, v0.4.0+): If b̂ + d̂ > max_val,
+    decrement the component whose pre-rounding value had the larger
+    fractional part. Tiebreaker: â LSB (even → decrement d̂, odd → b̂).
+    This eliminates the asymmetric belief bias of the v0.3.0 rule.
 
     Returns:
         (b̂, d̂, û, â) — quantized integer values.
@@ -102,15 +104,29 @@ def quantize_binomial(
 
     b_q = _quantize_single(b, mv)
     d_q = _quantize_single(d, mv)
+    a_q = _quantize_single(a, mv)
 
-    # Clamping rule: if b̂ + d̂ > max_val, decrement d̂ (bias toward belief)
+    # Symmetric clamping rule (§4.2, v0.4.0+):
+    # If b̂ + d̂ > max_val, decrement the component whose pre-rounding
+    # value had the larger fractional part (rounded up by more).
+    # Tiebreaker: â LSB (even → decrement d̂, odd → decrement b̂).
     if b_q + d_q > mv:
-        d_q -= 1
+        frac_b = b * mv - math.floor(b * mv)
+        frac_d = d * mv - math.floor(d * mv)
+
+        if frac_b > frac_d:
+            b_q -= 1
+        elif frac_d > frac_b:
+            d_q -= 1
+        else:
+            # Tiebreaker: â LSB
+            if a_q & 1 == 0:
+                d_q -= 1
+            else:
+                b_q -= 1
 
     # Derived uncertainty — never independently quantized
     u_q = mv - b_q - d_q
-
-    a_q = _quantize_single(a, mv)
 
     return (b_q, d_q, u_q, a_q)
 
@@ -156,15 +172,14 @@ def dequantize_binomial(
 def quantize_multinomial(
     beliefs: list[float], u: float, base_rates: list[float], precision: int = 8
 ) -> tuple[list[int], int, list[int]]:
-    """Constrained multinomial quantization (Definition 11).
+    """Constrained multinomial quantization (Definition 11, §4.4 v0.4.2+).
 
-    For domain cardinality k:
-      - Quantize k-1 belief components and u independently
-      - Derive b̂_k = (2^n - 1) - sum(b̂_1..b̂_{k-1}) - û
-      - Apply analogous constrained quantization to base rates
+    Uses integer simplex projection (Theorem 3c): quantize ALL k+1
+    components independently, compute excess, distribute ±1 corrections
+    by fractional-part rank with lower-index tiebreaker.
 
-    Clamping (Theorem 3c): If the derived b̂_k < 0, reduce the
-    largest b̂_i (for i < k) by 1 and recompute.
+    Replaces the v0.4.1 iterative decrement loop which had a flaw:
+    static fractional parts always targeted the same component.
 
     Returns:
         (beliefs_q, u_q, base_rates_q)
@@ -206,33 +221,48 @@ def quantize_multinomial(
 
     mv = _max_val(precision)
 
-    # Quantize k-1 beliefs independently, plus uncertainty
-    beliefs_q = [_quantize_single(beliefs[i], mv) for i in range(k - 1)]
-    u_q = _quantize_single(u, mv)
+    # Integer simplex projection (§4.4, v0.4.2+):
+    # Step 1: Quantize ALL k+1 components independently
+    all_values = beliefs + [u]
+    v = [_quantize_single(x, mv) for x in all_values]
+    fracs = [x * mv - math.floor(x * mv) for x in all_values]
 
-    # Derive k-th belief component
-    b_k_q = mv - sum(beliefs_q) - u_q
+    # Step 2: Compute excess
+    excess = sum(v) - mv
 
-    # Clamping (Theorem 3c): if derived b̂_k < 0, reduce largest b̂_i
-    while b_k_q < 0:
-        # Find index of the largest quantized belief among the first k-1
-        max_idx = max(range(len(beliefs_q)), key=lambda i: beliefs_q[i])
-        beliefs_q[max_idx] -= 1
-        b_k_q = mv - sum(beliefs_q) - u_q
+    # Step 3-4: Distribute corrections by fractional-part rank
+    if excess > 0:
+        # Over-budget: decrement components that rounded up the most
+        # Sort by frac DESCENDING, lower index wins ties
+        ranked = sorted(range(len(v)), key=lambda i: (-fracs[i], i))
+        for j in range(excess):
+            v[ranked[j]] -= 1
+    elif excess < 0:
+        # Under-budget: increment components that rounded down the most
+        # Sort by frac ASCENDING, lower index wins ties
+        ranked = sorted(range(len(v)), key=lambda i: (fracs[i], i))
+        for j in range(-excess):
+            v[ranked[j]] += 1
 
-    beliefs_q.append(b_k_q)
+    # Step 5: Assign
+    beliefs_q = v[:k]
+    u_q = v[k]
 
-    # Constrained quantization for base rates: same approach
-    base_rates_q = [_quantize_single(base_rates[i], mv) for i in range(k - 1)]
-    a_k_q = mv - sum(base_rates_q)
+    # Same projection for base rates (k components, sum = mv)
+    base_rates_v = [_quantize_single(base_rates[i], mv) for i in range(k)]
+    br_fracs = [base_rates[i] * mv - math.floor(base_rates[i] * mv) for i in range(k)]
+    br_excess = sum(base_rates_v) - mv
 
-    # Clamp base rates if needed
-    while a_k_q < 0:
-        max_idx = max(range(len(base_rates_q)), key=lambda i: base_rates_q[i])
-        base_rates_q[max_idx] -= 1
-        a_k_q = mv - sum(base_rates_q)
+    if br_excess > 0:
+        ranked = sorted(range(k), key=lambda i: (-br_fracs[i], i))
+        for j in range(br_excess):
+            base_rates_v[ranked[j]] -= 1
+    elif br_excess < 0:
+        ranked = sorted(range(k), key=lambda i: (br_fracs[i], i))
+        for j in range(-br_excess):
+            base_rates_v[ranked[j]] += 1
 
-    base_rates_q.append(a_k_q)
+    base_rates_q = base_rates_v
 
     return (beliefs_q, u_q, base_rates_q)
 
