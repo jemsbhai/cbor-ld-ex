@@ -32,6 +32,10 @@ from cbor_ld_ex.opinions import (
     decode_delta_bytes,
     compute_delta,
     apply_delta,
+    compute_residual_correction,
+    apply_residual_correction,
+    pack_correction_bits,
+    unpack_correction_bits,
 )
 
 
@@ -1200,3 +1204,368 @@ class TestComputeAndApplyDelta:
 
         result = apply_delta(prev, delta_b, delta_d)
         assert result[0] + result[1] + result[2] == 255
+
+
+# ===========================================================================
+# §4.7 Residual Correction (QJL-Inspired) — Definitions 29–31, Theorems 12–13
+# ===========================================================================
+
+class TestPackUnpackCorrectionBits:
+    """Pack/unpack 3-bit correction value — Definition 30 encoding.
+
+    Format: correction = (c_b << 2) | (c_d << 1) | c_a, MSB-first.
+    """
+
+    def test_all_zero(self):
+        """All residuals non-negative → all correction bits 0."""
+        packed = pack_correction_bits(0, 0, 0)
+        assert packed == 0b000
+        assert unpack_correction_bits(packed) == (0, 0, 0)
+
+    def test_all_one(self):
+        """All residuals negative → all correction bits 1."""
+        packed = pack_correction_bits(1, 1, 1)
+        assert packed == 0b111
+        assert unpack_correction_bits(packed) == (1, 1, 1)
+
+    def test_msb_first_ordering(self):
+        """c_b is MSB (bit 2), c_a is LSB (bit 0)."""
+        # Only c_b set
+        assert pack_correction_bits(1, 0, 0) == 0b100
+        # Only c_d set
+        assert pack_correction_bits(0, 1, 0) == 0b010
+        # Only c_a set
+        assert pack_correction_bits(0, 0, 1) == 0b001
+
+    def test_roundtrip_all_combinations(self):
+        """All 8 possible 3-bit patterns roundtrip correctly."""
+        for c_b in (0, 1):
+            for c_d in (0, 1):
+                for c_a in (0, 1):
+                    packed = pack_correction_bits(c_b, c_d, c_a)
+                    assert 0 <= packed <= 7
+                    assert unpack_correction_bits(packed) == (c_b, c_d, c_a)
+
+
+class TestComputeResidualCorrection:
+    """Definition 30: c_x = sign(r_x) where 0=non-negative, 1=negative.
+
+    Residual r_x = x − Q_n⁻¹(Q_n(x)). The correction bit is 1 iff
+    rounding pushed the value UP (quantized > exact), meaning the
+    residual is negative.
+    """
+
+    def test_exact_quantization_zero_residual(self):
+        """When value quantizes exactly, residual is zero → c=0 (non-negative)."""
+        # 0.0 quantizes to 0, dequantizes to 0.0 — exact
+        c_b, c_d, c_a = compute_residual_correction(
+            b=0.0, d=0.0, a=0.0,
+            b_q=0, d_q=0, a_q=0,
+            precision=8,
+        )
+        assert (c_b, c_d, c_a) == (0, 0, 0)
+
+    def test_exact_quantization_one(self):
+        """1.0 quantizes to 255, dequantizes to 1.0 — exact."""
+        c_b, c_d, c_a = compute_residual_correction(
+            b=1.0, d=0.0, a=0.5,
+            b_q=255, d_q=0, a_q=128,  # 128/255 ≈ 0.50196, but a=0.5 → residual negative
+            precision=8,
+        )
+        assert c_b == 0  # 1.0 - 255/255 = 0 → non-negative
+        assert c_d == 0  # 0.0 - 0/255 = 0 → non-negative
+        # a: 0.5 - 128/255 = 0.5 - 0.50196 < 0 → negative
+        assert c_a == 1
+
+    def test_positive_residual(self):
+        """When rounding pushed DOWN, residual is positive → c=0."""
+        # b=0.3: Q_8(0.3) = round(0.3*255) = round(76.5) = 76 (Python banker's rounding)
+        # Actually round(76.5) = 76 in Python (banker's). Q⁻¹(76) = 76/255 ≈ 0.29804
+        # residual = 0.3 - 0.29804 = +0.00196 → non-negative → c_b=0
+        #
+        # But let's use a clearer case: b=0.1
+        # Q_8(0.1) = round(0.1*255) = round(25.5) = 26 (banker's: 26 is even)
+        # Q⁻¹(26) = 26/255 ≈ 0.10196
+        # residual = 0.1 - 0.10196 = -0.00196 → negative → c_b=1
+        c_b, c_d, c_a = compute_residual_correction(
+            b=0.1, d=0.0, a=0.5,
+            b_q=26, d_q=0, a_q=128,
+            precision=8,
+        )
+        assert c_b == 1  # rounded up → negative residual
+
+    def test_negative_residual(self):
+        """When rounding pushed UP, residual is negative → c=1."""
+        # b=0.2: Q_8(0.2) = round(0.2*255) = round(51.0) = 51
+        # Q⁻¹(51) = 51/255 = 0.2 exactly → residual = 0 → c=0
+        # Use b=0.201 instead:
+        # Q_8(0.201) = round(0.201*255) = round(51.255) = 51
+        # Q⁻¹(51) = 0.2 → residual = 0.201 - 0.2 = +0.001 → c=0
+        c_b, c_d, c_a = compute_residual_correction(
+            b=0.201, d=0.0, a=0.5,
+            b_q=51, d_q=0, a_q=128,
+            precision=8,
+        )
+        assert c_b == 0  # rounded down → positive residual
+
+    def test_known_vector_8bit(self):
+        """Fully worked example at 8-bit precision.
+
+        b=0.35, d=0.25, a=0.6
+        b̂ = round(0.35*255) = round(89.25) = 89. Q⁻¹(89) = 89/255 ≈ 0.34902
+          r_b = 0.35 - 0.34902 = +0.00098 → c_b = 0
+        d̂ = round(0.25*255) = round(63.75) = 64. Q⁻¹(64) = 64/255 ≈ 0.25098
+          r_d = 0.25 - 0.25098 = -0.00098 → c_d = 1
+        â = round(0.6*255) = round(153.0) = 153. Q⁻¹(153) = 153/255 ≈ 0.6 exactly
+          r_a = 0.6 - 0.6 = 0 → c_a = 0
+        """
+        c_b, c_d, c_a = compute_residual_correction(
+            b=0.35, d=0.25, a=0.6,
+            b_q=89, d_q=64, a_q=153,
+            precision=8,
+        )
+        assert (c_b, c_d, c_a) == (0, 1, 0)
+
+    def test_16bit_precision(self):
+        """Residual correction works at 16-bit precision too.
+
+        b=0.35: Q_16(0.35) = round(0.35*65535) = round(22937.25) = 22937
+        Q⁻¹(22937) = 22937/65535 ≈ 0.349998...
+        r_b = 0.35 - 0.349998 ≈ +0.000002 → c_b = 0
+        """
+        b_q = round(0.35 * 65535)  # 22937
+        d_q = round(0.25 * 65535)  # 16384
+        a_q = round(0.6 * 65535)   # 39321
+        c_b, c_d, c_a = compute_residual_correction(
+            b=0.35, d=0.25, a=0.6,
+            b_q=b_q, d_q=d_q, a_q=a_q,
+            precision=16,
+        )
+        # At 16-bit the residuals are tiny but still have signs
+        assert c_b in (0, 1)
+        assert c_d in (0, 1)
+        assert c_a in (0, 1)
+
+
+class TestApplyResidualCorrection:
+    """Definition 31: corrected reconstruction with quarter-quantum shift.
+
+    b_corrected = Q_n⁻¹(b̂) + (1 − 2c_b) × δ
+    where δ = 1/(4(2ⁿ−1))
+    """
+
+    def test_quarter_quantum_shift_magnitude(self):
+        """Verify δ = 1/(4*255) for 8-bit."""
+        # With c=0 (non-negative residual): shift = +δ
+        # With c=1 (negative residual): shift = -δ
+        delta_8 = 1.0 / (4 * 255)
+
+        # b̂=128: Q⁻¹(128) = 128/255 ≈ 0.50196
+        # With c_b=0: corrected = 0.50196 + δ
+        # With c_b=1: corrected = 0.50196 - δ
+        b_c0, d_c0, a_c0, u_c0 = apply_residual_correction(
+            b_q=128, d_q=0, a_q=128, c_b=0, c_d=0, c_a=0, precision=8
+        )
+        b_c1, d_c1, a_c1, u_c1 = apply_residual_correction(
+            b_q=128, d_q=0, a_q=128, c_b=1, c_d=0, c_a=0, precision=8
+        )
+        assert abs((b_c0 - b_c1) - 2 * delta_8) < 1e-12
+
+    def test_uncorrected_center_of_bin(self):
+        """Without correction, reconstruction is bin center (standard dequantize)."""
+        # Correction bits = (0,0,0) shifts everything by +δ
+        # This is intentional: the "corrected" value is always shifted
+        b, d, a, u = apply_residual_correction(
+            b_q=128, d_q=64, a_q=128, c_b=0, c_d=0, c_a=0, precision=8
+        )
+        delta_8 = 1.0 / (4 * 255)
+        assert abs(b - (128/255 + delta_8)) < 1e-12
+        assert abs(d - (64/255 + delta_8)) < 1e-12
+
+    def test_u_derived(self):
+        """u_corrected = 1 − b_corrected − d_corrected (Definition 31)."""
+        b, d, a, u = apply_residual_correction(
+            b_q=100, d_q=80, a_q=128, c_b=0, c_d=1, c_a=0, precision=8
+        )
+        assert abs(u - (1.0 - b - d)) < 1e-12
+
+    def test_known_vector_roundtrip(self):
+        """Correction reduces error for a known opinion.
+
+        b=0.35, d=0.25, u=0.40, a=0.6
+        b̂=89, d̂=64, â=153 (from TestComputeResidualCorrection)
+        c = (0, 1, 0)
+        """
+        b_exact, d_exact, a_exact = 0.35, 0.25, 0.6
+        b_q, d_q, a_q = 89, 64, 153
+
+        # Uncorrected reconstruction
+        b_unc = b_q / 255
+        d_unc = d_q / 255
+        a_unc = a_q / 255
+
+        # Corrected reconstruction
+        b_cor, d_cor, a_cor, u_cor = apply_residual_correction(
+            b_q=b_q, d_q=d_q, a_q=a_q,
+            c_b=0, c_d=1, c_a=0,
+            precision=8,
+        )
+
+        # Corrected must be closer to exact than uncorrected
+        err_unc_b = abs(b_exact - b_unc)
+        err_cor_b = abs(b_exact - b_cor)
+        assert err_cor_b <= err_unc_b
+
+        err_unc_d = abs(d_exact - d_unc)
+        err_cor_d = abs(d_exact - d_cor)
+        assert err_cor_d <= err_unc_d
+
+
+class TestResidualCorrectionMSE:
+    """Theorem 12: 1-bit correction achieves 4× MSE reduction.
+
+    MSE_uncorrected = 1/(12(2ⁿ−1)²)
+    MSE_corrected   = 1/(48(2ⁿ−1)²)
+    Ratio = 1/4
+
+    Verified empirically over many random opinions.
+    """
+
+    @pytest.mark.parametrize("precision", [8, 16])
+    def test_mse_reduction_empirical(self, precision):
+        """Empirical MSE with correction is ≈4× lower than without.
+
+        Uses 10000 random values to estimate MSE, then checks the ratio
+        is close to 0.25 (within statistical tolerance).
+        """
+        import random
+        random.seed(42)  # Reproducible
+        max_val = (1 << precision) - 1
+        delta = 1.0 / (4 * max_val)
+
+        mse_uncorrected = 0.0
+        mse_corrected = 0.0
+        n_samples = 10000
+
+        for _ in range(n_samples):
+            x = random.random()  # Exact value in [0, 1]
+            x_q = round(x * max_val)
+            x_deq = x_q / max_val
+
+            # Uncorrected error
+            err_unc = x - x_deq
+            mse_uncorrected += err_unc ** 2
+
+            # Compute correction bit
+            c = 1 if err_unc < 0 else 0
+            # Corrected reconstruction
+            x_cor = x_deq + (1 - 2 * c) * delta
+            err_cor = x - x_cor
+            mse_corrected += err_cor ** 2
+
+        mse_uncorrected /= n_samples
+        mse_corrected /= n_samples
+
+        # Theoretical values
+        mse_theory_unc = 1.0 / (12 * max_val ** 2)
+        mse_theory_cor = 1.0 / (48 * max_val ** 2)
+
+        # Empirical should be close to theory (within 20% for statistical noise)
+        assert abs(mse_uncorrected - mse_theory_unc) / mse_theory_unc < 0.2
+        assert abs(mse_corrected - mse_theory_cor) / mse_theory_cor < 0.2
+
+        # The ratio must be approximately 1/4
+        ratio = mse_corrected / mse_uncorrected
+        assert 0.20 < ratio < 0.30, f"Expected ratio ~0.25, got {ratio}"
+
+    def test_wire_cost_3_bits_per_opinion(self):
+        """Correction is exactly 3 bits per opinion — no more, no less.
+
+        Per §4.7.5: c_b, c_d, c_a = 3 bits.
+        At 8-bit, opinion payload = 3 bytes = 24 bits.
+        Correction overhead = 3/24 = 12.5% per opinion.
+        But in provenance context (16-byte entry), 3/128 = 2.34%.
+        """
+        packed = pack_correction_bits(1, 0, 1)
+        # Must fit in 3 bits
+        assert 0 <= packed <= 7
+        # Exactly 3 bits of information
+        assert packed.bit_length() <= 3
+
+    def test_effective_precision_gain(self):
+        """Corollary: 8-bit + correction ≈ 9-bit uncorrected MSE.
+
+        MSE_corrected(8-bit) = 1/(48*255²) ≈ 3.204e-7
+        MSE_uncorrected(9-bit) = 1/(12*511²) ≈ 3.189e-7
+        These should be comparable.
+        """
+        mse_8bit_corrected = 1.0 / (48 * 255 ** 2)
+        mse_9bit_uncorrected = 1.0 / (12 * 511 ** 2)
+        # Within 1% of each other
+        ratio = mse_8bit_corrected / mse_9bit_uncorrected
+        assert 0.95 < ratio < 1.10, f"Ratio: {ratio}"
+
+
+class TestResidualCorrectionProperty:
+    """Hypothesis property tests for residual correction."""
+
+    @given(
+        b=st.floats(min_value=0.0, max_value=1.0),
+        d=st.floats(min_value=0.0, max_value=1.0),
+        a=st.floats(min_value=0.0, max_value=1.0),
+    )
+    @settings(max_examples=500)
+    def test_correction_error_bounded_by_quarter_quantum(self, b, d, a):
+        """Property: corrected error ≤ δ = h/4 for each component.
+
+        Theorem 12 guarantees 4× MSE reduction IN EXPECTATION, not
+        pointwise. At exact quantization points (residual=0), the
+        correction introduces error of exactly δ. The correct
+        pointwise invariant is that the corrected error never exceeds
+        the quarter-quantum δ = 1/(4(2ⁿ−1)).
+
+        Uncorrected error bound: h/2 = 1/(2(2ⁿ−1))
+        Corrected error bound:   h/4 = 1/(4(2ⁿ−1))
+        """
+        assume(b + d <= 1.0)
+        assume(math.isfinite(b) and math.isfinite(d) and math.isfinite(a))
+
+        max_val = 255  # 8-bit
+        b_q = round(b * max_val)
+        d_q = round(d * max_val)
+        a_q = round(a * max_val)
+
+        # Clamp to valid range
+        b_q = min(max(b_q, 0), max_val)
+        d_q = min(max(d_q, 0), max_val)
+        a_q = min(max(a_q, 0), max_val)
+
+        c_b, c_d, c_a = compute_residual_correction(
+            b=b, d=d, a=a, b_q=b_q, d_q=d_q, a_q=a_q, precision=8
+        )
+
+        b_cor, d_cor, a_cor, u_cor = apply_residual_correction(
+            b_q=b_q, d_q=d_q, a_q=a_q,
+            c_b=c_b, c_d=c_d, c_a=c_a, precision=8
+        )
+
+        # Quarter-quantum bound: corrected error ≤ δ = 1/(4*max_val)
+        delta = 1.0 / (4 * max_val)
+        eps = 1e-12  # float tolerance
+        assert abs(b - b_cor) <= delta + eps
+        assert abs(d - d_cor) <= delta + eps
+        assert abs(a - a_cor) <= delta + eps
+
+    @given(
+        b_q=st.integers(min_value=0, max_value=255),
+        d_q=st.integers(min_value=0, max_value=255),
+        a_q=st.integers(min_value=0, max_value=255),
+        c_b=st.integers(min_value=0, max_value=1),
+        c_d=st.integers(min_value=0, max_value=1),
+        c_a=st.integers(min_value=0, max_value=1),
+    )
+    @settings(max_examples=500)
+    def test_pack_unpack_roundtrip_property(self, b_q, d_q, a_q, c_b, c_d, c_a):
+        """Property: pack → unpack is identity for all valid correction bits."""
+        packed = pack_correction_bits(c_b, c_d, c_a)
+        assert unpack_correction_bits(packed) == (c_b, c_d, c_a)

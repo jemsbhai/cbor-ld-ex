@@ -268,6 +268,105 @@ def quantize_multinomial(
 
 
 # -------------------------------------------------------------------------
+# §4.7 Residual Correction (QJL-Inspired) — Definitions 29–31
+# -------------------------------------------------------------------------
+
+def pack_correction_bits(c_b: int, c_d: int, c_a: int) -> int:
+    """Pack 3 correction bits into a single integer (Definition 30).
+
+    Format: (c_b << 2) | (c_d << 1) | c_a, MSB-first.
+    c_b is bit 2 (MSB), c_a is bit 0 (LSB).
+
+    Args:
+        c_b: Belief correction bit (0=non-negative residual, 1=negative).
+        c_d: Disbelief correction bit.
+        c_a: Base rate correction bit.
+
+    Returns:
+        3-bit packed integer in range [0, 7].
+    """
+    return (c_b << 2) | (c_d << 1) | c_a
+
+
+def unpack_correction_bits(packed: int) -> tuple[int, int, int]:
+    """Unpack a 3-bit correction value to (c_b, c_d, c_a).
+
+    Inverse of pack_correction_bits.
+
+    Args:
+        packed: 3-bit integer in range [0, 7].
+
+    Returns:
+        (c_b, c_d, c_a) each 0 or 1.
+    """
+    c_b = (packed >> 2) & 1
+    c_d = (packed >> 1) & 1
+    c_a = packed & 1
+    return (c_b, c_d, c_a)
+
+
+def compute_residual_correction(
+    b: float, d: float, a: float,
+    b_q: int, d_q: int, a_q: int,
+    precision: int,
+) -> tuple[int, int, int]:
+    """Compute 1-bit residual correction signs (Definition 30).
+
+    For each component x with quantized value x̂:
+      r_x = x − Q_n⁻¹(x̂)
+      c_x = 1 if r_x < 0, else 0
+
+    The correction bit is 1 when rounding pushed the quantized value
+    ABOVE the exact value (negative residual).
+
+    Args:
+        b, d, a: Exact (pre-quantization) opinion components.
+        b_q, d_q, a_q: Quantized integer values.
+        precision: Quantization precision (8 or 16).
+
+    Returns:
+        (c_b, c_d, c_a) each 0 or 1.
+    """
+    max_val = _max_val(precision)
+    r_b = b - b_q / max_val
+    r_d = d - d_q / max_val
+    r_a = a - a_q / max_val
+    c_b = 1 if r_b < 0 else 0
+    c_d = 1 if r_d < 0 else 0
+    c_a = 1 if r_a < 0 else 0
+    return (c_b, c_d, c_a)
+
+
+def apply_residual_correction(
+    b_q: int, d_q: int, a_q: int,
+    c_b: int, c_d: int, c_a: int,
+    precision: int,
+) -> tuple[float, float, float, float]:
+    """Apply 1-bit residual correction to reconstruct opinion (Definition 31).
+
+    x_corrected = Q_n⁻¹(x̂) + (1 − 2c_x) × δ
+    where δ = 1/(4(2ⁿ−1)) is the quarter-quantum shift.
+
+    u_corrected is derived: 1 − b_corrected − d_corrected.
+
+    Args:
+        b_q, d_q, a_q: Quantized integer values.
+        c_b, c_d, c_a: Correction bits (0 or 1).
+        precision: Quantization precision (8 or 16).
+
+    Returns:
+        (b_corrected, d_corrected, a_corrected, u_corrected).
+    """
+    max_val = _max_val(precision)
+    delta = 1.0 / (4 * max_val)
+    b_cor = b_q / max_val + (1 - 2 * c_b) * delta
+    d_cor = d_q / max_val + (1 - 2 * c_d) * delta
+    a_cor = a_q / max_val + (1 - 2 * c_a) * delta
+    u_cor = 1.0 - b_cor - d_cor
+    return (b_cor, d_cor, a_cor, u_cor)
+
+
+# -------------------------------------------------------------------------
 # Delta encoding — §7.6, precision_mode=11
 #
 # Wire format: exactly 2 bytes, zero overhead.
