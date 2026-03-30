@@ -30,6 +30,8 @@ from cbor_ld_ex.headers import (
 from cbor_ld_ex.opinions import (
     encode_opinion_bytes,
     decode_opinion_bytes,
+    encode_delta_bytes,
+    decode_delta_bytes,
 )
 from cbor_ld_ex.temporal import (
     ExtensionBlock,
@@ -88,10 +90,17 @@ def encode_annotation(ann: Annotation) -> bytes:
 
     opinion_bytes = b""
     if ann.header.has_opinion and ann.opinion is not None:
-        precision = _PRECISION_MAP[ann.header.precision_mode]
-        b_q, d_q, u_q, a_q = ann.opinion
-        # Wire format: transmit (b̂, d̂, â) only. û is derived by decoder.
-        opinion_bytes = encode_opinion_bytes(b_q, d_q, a_q, precision=precision)
+        if ann.header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode (§7.6): 2-byte payload (Δb̂, Δd̂). Separate
+            # code path — delta is not "another precision", it's a
+            # fundamentally different wire format.
+            delta_b, delta_d = ann.opinion
+            opinion_bytes = encode_delta_bytes(delta_b, delta_d)
+        else:
+            precision = _PRECISION_MAP[ann.header.precision_mode]
+            b_q, d_q, u_q, a_q = ann.opinion
+            # Wire format: transmit (b̂, d̂, â) only. û is derived by decoder.
+            opinion_bytes = encode_opinion_bytes(b_q, d_q, a_q, precision=precision)
 
     extension_bytes = b""
     if ann.extensions is not None:
@@ -103,8 +112,11 @@ def encode_annotation(ann: Annotation) -> bytes:
 def _opinion_wire_size(precision_mode: PrecisionMode) -> int:
     """Return the wire size of an opinion payload in bytes.
 
-    3 values transmitted (b̂, d̂, â); û derived by decoder.
+    Modes 00–10: 3 values transmitted (b̂, d̂, â); û derived by decoder.
+    Mode 11 (delta): 2 bytes (Δb̂, Δd̂); â unchanged, û derived.
     """
+    if precision_mode == PrecisionMode.DELTA_8:
+        return 2  # §7.6: signed int8 pair
     precision = _PRECISION_MAP[precision_mode]
     if precision == 32:
         return 12  # 3 × float32
@@ -124,10 +136,14 @@ def decode_annotation(data: bytes) -> Annotation:
 
     opinion = None
     if header.has_opinion:
-        precision = _PRECISION_MAP[header.precision_mode]
         opinion_size = _opinion_wire_size(header.precision_mode)
         opinion_data = data[offset:offset + opinion_size]
-        opinion = decode_opinion_bytes(opinion_data, precision=precision)
+        if header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode (§7.6): decode to 2-tuple (Δb̂, Δd̂)
+            opinion = decode_delta_bytes(opinion_data)
+        else:
+            precision = _PRECISION_MAP[header.precision_mode]
+            opinion = decode_opinion_bytes(opinion_data, precision=precision)
         offset += opinion_size
 
     # Extensions: detected by remaining bytes after header + opinion

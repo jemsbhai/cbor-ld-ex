@@ -343,3 +343,126 @@ class TestAxiom1Stripping:
         stripped = {k: v for k, v in decoded_message.items()
                     if k != CBOR_TAG_CBORLD_EX}
         assert stripped == data_payload
+
+
+# ---------------------------------------------------------------------------
+# 6. Delta mode annotations — §7.6, precision_mode=11
+# ---------------------------------------------------------------------------
+
+class TestDeltaAnnotation:
+    """Delta mode (precision_mode=DELTA_8) annotation encode/decode.
+
+    Per §7.6: delta opinion is 2 bytes (Δb̂, Δd̂), not the standard
+    3-byte (b̂, d̂, â) payload. Annotation.opinion stores a 2-tuple.
+    """
+
+    def test_tier1_delta_size_3_bytes(self):
+        """Tier 1 + delta: 1-byte header + 2-byte payload = 3 bytes.
+
+        This is the minimum CBOR-LD-ex annotation with an opinion.
+        §11.2: 24 wire bits, 23.170 Shannon bits, 96.5% efficiency.
+        """
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        ann = Annotation(
+            header=header,
+            opinion=(5, -3),  # (Δb̂, Δd̂) — 2-tuple
+        )
+        data = encode_annotation(ann)
+        assert len(data) == 3
+
+    def test_tier1_delta_roundtrip(self):
+        """Encode → decode preserves 2-tuple delta opinion exactly."""
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        ann = Annotation(
+            header=header,
+            opinion=(10, -7),
+        )
+        data = encode_annotation(ann)
+        decoded = decode_annotation(data)
+
+        assert isinstance(decoded.header, Tier1Header)
+        assert decoded.header.precision_mode == PrecisionMode.DELTA_8
+        assert decoded.header.has_opinion is True
+        assert decoded.opinion == (10, -7)
+
+    def test_tier1_delta_zero_change(self):
+        """Delta of (0, 0) roundtrips — no change in opinion."""
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        ann = Annotation(header=header, opinion=(0, 0))
+        data = encode_annotation(ann)
+        decoded = decode_annotation(data)
+        assert decoded.opinion == (0, 0)
+
+    def test_tier1_delta_extreme_values(self):
+        """Extreme signed int8 boundaries: -128 and +127."""
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        ann = Annotation(header=header, opinion=(-128, 127))
+        data = encode_annotation(ann)
+        decoded = decode_annotation(data)
+        assert decoded.opinion == (-128, 127)
+
+    def test_tier2_delta_size_6_bytes(self):
+        """Tier 2 + delta: 4-byte header + 2-byte payload = 6 bytes."""
+        header = Tier2Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+            operator_id=OperatorId.TEMPORAL_DECAY,
+            reasoning_context=1,
+            context_version=0,
+            has_multinomial=False,
+            sub_tier_depth=0,
+            source_count=1,
+        )
+        ann = Annotation(header=header, opinion=(3, -2))
+        data = encode_annotation(ann)
+        assert len(data) == 6
+
+    def test_tier2_delta_roundtrip(self):
+        """Tier 2 delta roundtrips with full header fields."""
+        header = Tier2Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+            operator_id=OperatorId.TEMPORAL_DECAY,
+            reasoning_context=3,
+            context_version=2,
+            has_multinomial=False,
+            sub_tier_depth=1,
+            source_count=5,
+        )
+        ann = Annotation(header=header, opinion=(-50, 20))
+        data = encode_annotation(ann)
+        decoded = decode_annotation(data)
+
+        assert isinstance(decoded.header, Tier2Header)
+        assert decoded.header.precision_mode == PrecisionMode.DELTA_8
+        assert decoded.header.source_count == 5
+        assert decoded.opinion == (-50, 20)
+
+    def test_opinion_wire_size_delta(self):
+        """_opinion_wire_size returns 2 for DELTA_8 mode."""
+        from cbor_ld_ex.annotations import _opinion_wire_size
+        assert _opinion_wire_size(PrecisionMode.DELTA_8) == 2
