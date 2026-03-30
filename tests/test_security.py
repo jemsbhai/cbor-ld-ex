@@ -67,6 +67,9 @@ from cbor_ld_ex.security import (
     AUDIT_DIGEST_SIZE_BYTES,
     AUDIT_ENTRY_SIZE,
     AUDIT_CHAIN_ORIGIN_SENTINEL,
+    # §4.7 Provenance block with correction bits
+    encode_provenance_block,
+    decode_provenance_block,
 )
 
 # Reference for cross-validation
@@ -442,38 +445,45 @@ class TestProvenanceEntry:
     @given(
         origin_tier=st.integers(min_value=0, max_value=2),
         operator_id=st.integers(min_value=0, max_value=12),
-        precision_mode=st.integers(min_value=0, max_value=2),
         b_q=st.integers(min_value=0, max_value=255),
         d_q=st.integers(min_value=0, max_value=255),
         a_q=st.integers(min_value=0, max_value=255),
         timestamp=st.integers(min_value=0, max_value=2**32 - 1),
         prev_digest=st.binary(min_size=8, max_size=8),
+        has_correction=st.booleans(),
     )
     @settings(max_examples=500, deadline=None)
     def test_entry_roundtrip_property(
-        self, origin_tier, operator_id, precision_mode,
-        b_q, d_q, a_q, timestamp, prev_digest,
+        self, origin_tier, operator_id,
+        b_q, d_q, a_q, timestamp, prev_digest, has_correction,
     ):
-        """Property: any valid entry round-trips exactly."""
+        """Property: any valid entry round-trips exactly.
+
+        §9.4: provenance entries are always 8-bit (precision_mode=0).
+        §4.7.5: bit 0 of byte 0 is repurposed as has_correction, so
+        precision_mode is constrained to 0 (the only spec-valid value).
+        """
         original = ProvenanceEntry(
             origin_tier=origin_tier,
             operator_id=operator_id,
-            precision_mode=precision_mode,
+            precision_mode=0,  # §9.4: provenance is always 8-bit
             b_q=b_q, d_q=d_q, a_q=a_q,
             timestamp=timestamp,
             prev_digest=prev_digest,
+            has_correction=has_correction,
         )
         data = encode_provenance_entry(original)
         assert len(data) == 16
         recovered = decode_provenance_entry(data)
         assert recovered.origin_tier == origin_tier
         assert recovered.operator_id == operator_id
-        assert recovered.precision_mode == precision_mode
+        assert recovered.precision_mode == 0
         assert recovered.b_q == b_q
         assert recovered.d_q == d_q
         assert recovered.a_q == a_q
         assert recovered.timestamp == timestamp
         assert recovered.prev_digest == prev_digest
+        assert recovered.has_correction == has_correction
 
 
 # =========================================================================
@@ -985,3 +995,284 @@ class TestAuditGradeChain:
         assert len(aud_digest) == 16
         # Different content (different input bytes due to different sentinel size)
         assert std_digest != aud_digest[:8]
+
+
+# ===========================================================================
+# §4.7.5 Provenance Entry has_correction bit & Correction Block
+# ===========================================================================
+
+class TestHasCorrectionBit:
+    """Byte 0 repurposing: [origin_tier:2][operator_id:4][precision_bit_high:1][has_correction:1].
+
+    Provenance entries always use 8-bit opinions, so precision_mode is always
+    0b00. We repurpose bit 0 as has_correction. Backward-compatible: entries
+    with has_correction=False produce identical bytes to v0.3.0.
+    """
+
+    def test_backward_compat_no_correction(self):
+        """Entry without correction encodes identically to pre-v0.4.4."""
+        entry = ProvenanceEntry(
+            origin_tier=1, operator_id=3, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+            has_correction=False,
+        )
+        data = encode_provenance_entry(entry)
+        # Byte 0: tier=01, op=0011, precision_high=0, has_correction=0 = 0b01_0011_0_0 = 0x4C
+        assert data[0] == 0x4C
+        assert len(data) == 16
+
+    def test_has_correction_sets_bit0(self):
+        """Entry with correction sets bit 0 of byte 0."""
+        entry = ProvenanceEntry(
+            origin_tier=1, operator_id=3, precision_mode=0,
+            b_q=200, d_q=30, a_q=128,
+            timestamp=1710230400,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+            has_correction=True,
+        )
+        data = encode_provenance_entry(entry)
+        # Byte 0: tier=01, op=0011, precision_high=0, has_correction=1 = 0b01_0011_0_1 = 0x4D
+        assert data[0] == 0x4D
+        assert len(data) == 16  # Entry size unchanged
+
+    def test_decode_roundtrip_no_correction(self):
+        """Decode of has_correction=False entry reads has_correction=False."""
+        entry = ProvenanceEntry(
+            origin_tier=2, operator_id=5, precision_mode=0,
+            b_q=100, d_q=80, a_q=200,
+            timestamp=1710230500,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+            has_correction=False,
+        )
+        data = encode_provenance_entry(entry)
+        decoded = decode_provenance_entry(data)
+        assert decoded.has_correction is False
+        assert decoded.origin_tier == 2
+        assert decoded.operator_id == 5
+
+    def test_decode_roundtrip_with_correction(self):
+        """Decode of has_correction=True entry reads has_correction=True."""
+        entry = ProvenanceEntry(
+            origin_tier=0, operator_id=7, precision_mode=0,
+            b_q=150, d_q=60, a_q=128,
+            timestamp=1710230600,
+            prev_digest=CHAIN_ORIGIN_SENTINEL,
+            has_correction=True,
+        )
+        data = encode_provenance_entry(entry)
+        decoded = decode_provenance_entry(data)
+        assert decoded.has_correction is True
+        assert decoded.origin_tier == 0
+        assert decoded.operator_id == 7
+
+    def test_old_entries_decode_as_no_correction(self):
+        """Pre-v0.4.4 entries (precision_mode=0) decode with has_correction=False.
+
+        This is the backward compatibility guarantee: existing chain data
+        created before the has_correction amendment produces identical
+        decoded entries.
+        """
+        # Manually construct pre-v0.4.4 byte 0: tier=1, op=0, pm=0 = 0b01_0000_00 = 0x40
+        old_data = bytes([0x40, 200, 30, 128]) + struct.pack(">I", 1710230400) + CHAIN_ORIGIN_SENTINEL
+        decoded = decode_provenance_entry(old_data)
+        assert decoded.has_correction is False
+        assert decoded.precision_mode == 0
+
+    def test_audit_grade_with_correction(self):
+        """has_correction works with audit-grade (24-byte) entries too."""
+        entry = ProvenanceEntry(
+            origin_tier=1, operator_id=2, precision_mode=0,
+            b_q=180, d_q=40, a_q=128,
+            timestamp=1710230700,
+            prev_digest=AUDIT_CHAIN_ORIGIN_SENTINEL,
+            has_correction=True,
+        )
+        data = encode_provenance_entry(entry, audit_grade=True)
+        assert len(data) == 24
+        assert data[0] & 0x01 == 1  # has_correction bit set
+        decoded = decode_provenance_entry(data, audit_grade=True)
+        assert decoded.has_correction is True
+
+
+class TestProvenanceBlock:
+    """§4.7.5 Provenance block: chain_length + entries + correction block.
+
+    Wire format:
+      [1 byte]           chain_length (L)
+      [entry_size*L bytes] entries
+      [ceil(3*C/8) bytes]  correction block (C = count of has_correction=True)
+
+    Correction block: 3 bits per corrected entry (c_b, c_d, c_a) in chain
+    order, MSB-first, zero-padded to byte boundary.
+    """
+
+    def _make_chain(self, length, corrected_indices=None, audit_grade=False):
+        """Helper: build a valid provenance chain of given length."""
+        sentinel = AUDIT_CHAIN_ORIGIN_SENTINEL if audit_grade else CHAIN_ORIGIN_SENTINEL
+        entries = []
+        prev = sentinel
+        for i in range(length):
+            has_corr = i in (corrected_indices or [])
+            e = ProvenanceEntry(
+                origin_tier=1, operator_id=i % 16, precision_mode=0,
+                b_q=200 - i, d_q=30 + i, a_q=128,
+                timestamp=1710230400 + i,
+                prev_digest=prev,
+                has_correction=has_corr,
+                c_b=1 if has_corr else 0,
+                c_d=0,
+                c_a=1 if has_corr else 0,
+            )
+            entry_bytes = encode_provenance_entry(e, audit_grade=audit_grade)
+            prev = compute_entry_digest(entry_bytes, audit_grade=audit_grade)
+            entries.append(e)
+        return entries
+
+    def test_no_corrections_block_format(self):
+        """Block with no corrections: chain_length + entries, no correction block."""
+        entries = self._make_chain(3)
+        data = encode_provenance_block(entries)
+        assert data[0] == 3  # chain_length
+        assert len(data) == 1 + 3 * 16  # no correction bytes
+
+    def test_all_corrections_block_format(self):
+        """Block with all entries corrected: correction block appended."""
+        entries = self._make_chain(3, corrected_indices={0, 1, 2})
+        data = encode_provenance_block(entries)
+        # 3 corrected entries × 3 bits = 9 bits → ceil(9/8) = 2 bytes
+        assert len(data) == 1 + 3 * 16 + 2
+
+    def test_mixed_corrections_block_format(self):
+        """Block with some entries corrected."""
+        entries = self._make_chain(5, corrected_indices={1, 3})
+        data = encode_provenance_block(entries)
+        # 2 corrected entries × 3 bits = 6 bits → ceil(6/8) = 1 byte
+        assert len(data) == 1 + 5 * 16 + 1
+
+    def test_roundtrip_no_corrections(self):
+        """Encode → decode roundtrip with no corrections."""
+        entries = self._make_chain(3)
+        data = encode_provenance_block(entries)
+        decoded = decode_provenance_block(data)
+        assert len(decoded) == 3
+        for orig, dec in zip(entries, decoded):
+            assert dec.origin_tier == orig.origin_tier
+            assert dec.operator_id == orig.operator_id
+            assert dec.b_q == orig.b_q
+            assert dec.d_q == orig.d_q
+            assert dec.a_q == orig.a_q
+            assert dec.timestamp == orig.timestamp
+            assert dec.prev_digest == orig.prev_digest
+            assert dec.has_correction is False
+
+    def test_roundtrip_all_corrections(self):
+        """Encode → decode roundtrip with all entries corrected."""
+        entries = self._make_chain(3, corrected_indices={0, 1, 2})
+        data = encode_provenance_block(entries)
+        decoded = decode_provenance_block(data)
+        assert len(decoded) == 3
+        for orig, dec in zip(entries, decoded):
+            assert dec.has_correction is True
+            assert dec.c_b == orig.c_b
+            assert dec.c_d == orig.c_d
+            assert dec.c_a == orig.c_a
+
+    def test_roundtrip_mixed_corrections(self):
+        """Encode → decode roundtrip with mixed corrected/uncorrected entries."""
+        entries = self._make_chain(5, corrected_indices={1, 3})
+        data = encode_provenance_block(entries)
+        decoded = decode_provenance_block(data)
+        assert len(decoded) == 5
+        # Entry 0: no correction
+        assert decoded[0].has_correction is False
+        # Entry 1: corrected
+        assert decoded[1].has_correction is True
+        assert decoded[1].c_b == entries[1].c_b
+        assert decoded[1].c_d == entries[1].c_d
+        assert decoded[1].c_a == entries[1].c_a
+        # Entry 2: no correction
+        assert decoded[2].has_correction is False
+        # Entry 3: corrected
+        assert decoded[3].has_correction is True
+        assert decoded[3].c_b == entries[3].c_b
+        assert decoded[3].c_d == entries[3].c_d
+        assert decoded[3].c_a == entries[3].c_a
+        # Entry 4: no correction
+        assert decoded[4].has_correction is False
+
+    def test_correction_bit_pattern_known_vector(self):
+        """Verify exact correction block bytes for a known pattern.
+
+        2 corrected entries with corrections (1,0,1) and (0,1,0).
+        Packed MSB-first: [101_010_00] = 0xA8.
+        """
+        entries = self._make_chain(2, corrected_indices={0, 1})
+        # Override correction bits for known vector
+        entries[0].c_b, entries[0].c_d, entries[0].c_a = 1, 0, 1
+        entries[1].c_b, entries[1].c_d, entries[1].c_a = 0, 1, 0
+        data = encode_provenance_block(entries)
+        # Correction block is last byte(s)
+        correction_block = data[1 + 2 * 16:]
+        assert len(correction_block) == 1  # 6 bits → 1 byte
+        assert correction_block[0] == 0b10101000  # 101_010_00 (padded)
+
+    def test_single_entry_corrected(self):
+        """Single-entry chain with correction."""
+        entries = self._make_chain(1, corrected_indices={0})
+        entries[0].c_b, entries[0].c_d, entries[0].c_a = 1, 1, 0
+        data = encode_provenance_block(entries)
+        # 3 bits → 1 byte: [110_00000] = 0xC0
+        assert len(data) == 1 + 16 + 1
+        assert data[-1] == 0b11000000
+        decoded = decode_provenance_block(data)
+        assert decoded[0].c_b == 1
+        assert decoded[0].c_d == 1
+        assert decoded[0].c_a == 0
+
+    def test_ten_entries_all_corrected_space_efficiency(self):
+        """§4.7.5 Table: L=10 all corrected → 4 bytes correction overhead.
+
+        10 × 3 bits = 30 bits → ceil(30/8) = 4 bytes.
+        Total = 1 + 160 + 4 = 165 bytes.
+        Overhead vs baseline (1 + 160 = 161): +4 bytes = +2.5%.
+        """
+        entries = self._make_chain(10, corrected_indices=set(range(10)))
+        data = encode_provenance_block(entries)
+        assert len(data) == 1 + 10 * 16 + 4
+        # Overhead
+        baseline = 1 + 10 * 16
+        overhead_pct = (len(data) - baseline) / baseline * 100
+        assert abs(overhead_pct - 2.48) < 0.1  # ~2.5%
+
+    def test_audit_grade_block_roundtrip(self):
+        """Provenance block works with audit-grade (24-byte) entries."""
+        entries = self._make_chain(3, corrected_indices={0, 2}, audit_grade=True)
+        data = encode_provenance_block(entries, audit_grade=True)
+        assert data[0] == 3
+        # 2 corrections × 3 bits = 6 bits → 1 byte
+        assert len(data) == 1 + 3 * 24 + 1
+        decoded = decode_provenance_block(data, audit_grade=True)
+        assert len(decoded) == 3
+        assert decoded[0].has_correction is True
+        assert decoded[1].has_correction is False
+        assert decoded[2].has_correction is True
+
+    def test_chain_verification_still_works_with_block(self):
+        """Chain digest verification is unaffected by has_correction bit.
+
+        The has_correction bit is part of byte 0 and thus part of the
+        entry bytes that get hashed. Verification must still pass.
+        """
+        entries = self._make_chain(3, corrected_indices={1})
+        is_valid, err_idx = verify_provenance_chain(entries)
+        assert is_valid is True
+        assert err_idx == -1
+
+    def test_empty_chain_block(self):
+        """Empty chain encodes as single zero byte."""
+        data = encode_provenance_block([])
+        assert data == b"\x00"
+        decoded = decode_provenance_block(data)
+        assert decoded == []
