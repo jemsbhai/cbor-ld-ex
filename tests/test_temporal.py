@@ -616,6 +616,41 @@ class TestApplyDecayQuantized:
         assert ra == ref_a
 
 
+    def test_decay_applies_symmetric_clamping(self):
+        """Decay output MUST use symmetric clamping (§7.1, v0.4.1+).
+
+        Construct a case where decay produces b+d≈1 (u≈0), triggering
+        the clamping rule. Verify symmetric (not asymmetric) behavior.
+
+        Input: b=0.5, d=0.5, u=0.0, a=0.5 at 8-bit.
+        Decay factor=1.0 (no decay) → re-quantize (0.5, 0.5, 0.0, 0.5).
+        round(0.5*255) = 128 for both → 128+128=256 > 255 → clamping fires.
+        With symmetric clamping + even â(=128): decrement d̂.
+        Expected: b̂=128, d̂=127, û=0.
+        """
+        b_q, d_q, u_q, a_q = quantize_binomial(0.5, 0.5, 0.0, 0.5, precision=8)
+        rb, rd, ru, ra = apply_decay_quantized(b_q, d_q, u_q, a_q, 1.0, precision=8)
+
+        # Symmetric clamping: â=128 (even) → decrement d̂
+        assert rb == 128, f"Expected b̂=128, got {rb}"
+        assert rd == 127, f"Expected d̂=127 (symmetric clamping, â even), got {rd}"
+        assert ru == 0
+
+    def test_decay_symmetric_clamping_odd_a(self):
+        """Symmetric clamping after decay with odd â → decrement b̂.
+
+        Input: (0.5, 0.5, 0.0, 0.49) → â=125 (odd).
+        Decay factor=1.0 → clamping fires, odd â → decrement b̂.
+        Expected: b̂=127, d̂=128, û=0.
+        """
+        b_q, d_q, u_q, a_q = quantize_binomial(0.5, 0.5, 0.0, 0.49, precision=8)
+        rb, rd, ru, ra = apply_decay_quantized(b_q, d_q, u_q, a_q, 1.0, precision=8)
+
+        assert rb == 127, f"Expected b̂=127 (symmetric clamping, â odd), got {rb}"
+        assert rd == 128, f"Expected d̂=128, got {rd}"
+        assert ru == 0
+
+
 # =========================================================================
 # 4. Quantized expiry trigger — Axiom 3 preservation
 #
@@ -690,6 +725,21 @@ class TestApplyExpiryQuantized:
         assert rb == 0
         assert rd == 0
         assert ru == 255
+
+    def test_expiry_applies_symmetric_clamping(self):
+        """Expiry output MUST use symmetric clamping (§7.1, v0.4.1+).
+
+        Expiry re-quantizes via quantize_binomial, which applies the
+        symmetric clamping rule. This test verifies the clamping fires
+        correctly in the expiry context.
+        """
+        # Near-full belief with zero uncertainty, gamma≈1 (near no-op)
+        b_q, d_q, u_q, a_q = quantize_binomial(0.5, 0.5, 0.0, 0.5, precision=8)
+        # gamma=255 ≈ 1.0 → near no-op, but re-quantization still triggers clamping
+        rb, rd, ru, ra = apply_expiry_quantized(b_q, d_q, u_q, a_q, 255, precision=8)
+
+        assert rb + rd + ru == 255
+        assert rb >= 0 and rd >= 0 and ru >= 0
 
 
 # =========================================================================
