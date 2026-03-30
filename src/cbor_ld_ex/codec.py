@@ -258,7 +258,7 @@ _COMPLIANCE_STATUS_STATES = 3     # compliant, non_compliant, insufficient
 _DELEGATION_FLAG_STATES = 2
 _ORIGIN_TIER_STATES = 3           # 3 defined tiers (reserved excluded)
 _HAS_OPINION_STATES = 2
-_PRECISION_MODE_STATES = 3        # 3 defined modes (reserved excluded)
+_PRECISION_MODE_STATES = 4        # 4 defined modes: 8/16/32/delta (§4.3, v0.4.0+)
 _OPERATOR_ID_STATES = 13          # 13 defined operators (Table 2)
 _REASONING_CONTEXT_STATES = 16    # 4-bit field, full range usable
 _CONTEXT_VERSION_STATES = 16
@@ -361,14 +361,21 @@ def annotation_information_bits(annotation: Annotation) -> dict:
     opinion_wire_bits = 0
 
     if header.has_opinion and annotation.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[header.precision_mode]
-        opinion_info_bits = _opinion_information_bits(precision)
-        opinion_wire_bits = _opinion_wire_bits(precision)
+        if header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode (§7.6): two signed int8 values, each with
+            # 256 states. log₂(256) + log₂(256) = 16 bits exactly.
+            # Wire cost: 2 bytes = 16 bits. 100% efficiency.
+            opinion_info_bits = 16.0
+            opinion_wire_bits = 16
+        else:
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[header.precision_mode]
+            opinion_info_bits = _opinion_information_bits(precision)
+            opinion_wire_bits = _opinion_wire_bits(precision)
         fields["opinion_tuple"] = opinion_info_bits
 
     # ── Totals ───────────────────────────────────────────────────
@@ -419,24 +426,33 @@ def _annotation_to_jsonld(annotation: Annotation) -> dict:
     )
 
     if annotation.header.has_opinion and annotation.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[annotation.header.precision_mode]
-
-        if precision == 32:
-            b, d, u, a = annotation.opinion
+        if annotation.header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode (§7.6): cannot dequantize without previous
+            # state. Report the raw deltas honestly.
+            delta_b, delta_d = annotation.opinion
+            result["opinion"] = {
+                "delta_belief": delta_b,
+                "delta_disbelief": delta_d,
+            }
         else:
-            b, d, u, a = dequantize_binomial(
-                *annotation.opinion, precision=precision
-            )
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[annotation.header.precision_mode]
 
-        result["opinion"] = {
-            "belief": b, "disbelief": d,
-            "uncertainty": u, "baseRate": a,
-        }
+            if precision == 32:
+                b, d, u, a = annotation.opinion
+            else:
+                b, d, u, a = dequantize_binomial(
+                    *annotation.opinion, precision=precision
+                )
+
+            result["opinion"] = {
+                "belief": b, "disbelief": d,
+                "uncertainty": u, "baseRate": a,
+            }
 
     result["reasoningBackend"] = "subjective_logic"
 
@@ -469,22 +485,27 @@ def _annotation_to_cbor_ld_bytes(annotation: Annotation) -> bytes:
     }
 
     if annotation.header.has_opinion and annotation.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[annotation.header.precision_mode]
-
-        if precision == 32:
-            b, d, u, a = annotation.opinion
+        if annotation.header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode: CBOR-LD baseline encodes the raw deltas
+            delta_b, delta_d = annotation.opinion
+            cbor_ann[1] = {0: delta_b, 1: delta_d}
         else:
-            b, d, u, a = dequantize_binomial(
-                *annotation.opinion, precision=precision
-            )
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[annotation.header.precision_mode]
 
-        # CBOR encodes floats natively — still 4+ bytes each
-        cbor_ann[1] = {0: b, 1: d, 2: u, 3: a}
+            if precision == 32:
+                b, d, u, a = annotation.opinion
+            else:
+                b, d, u, a = dequantize_binomial(
+                    *annotation.opinion, precision=precision
+                )
+
+            # CBOR encodes floats natively — still 4+ bytes each
+            cbor_ann[1] = {0: b, 1: d, 2: u, 3: a}
 
     # Tier 2/3 fields
     header = annotation.header

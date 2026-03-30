@@ -892,7 +892,7 @@ class TestBitLevelAnalysis:
             + math.log2(2) # delegation_flag
             + math.log2(3) # origin_tier
             + math.log2(2) # has_opinion
-            + math.log2(3) # precision_mode
+            + math.log2(4) # precision_mode (4 defined: 8/16/32/delta)
         )
         assert math.isclose(result["header_info_bits"], expected_header, rel_tol=1e-9)
         assert result["header_wire_bits"] == 8
@@ -1016,6 +1016,149 @@ class TestBitLevelAnalysis:
         assert math.isclose(
             total, result["total_info_bits"], rel_tol=1e-9,
         )
+
+
+class TestDeltaBitAnalysis:
+    """Delta mode (§7.6) bit-level analysis.
+
+    §11.2: Delta Tier 1 = 23.170 Shannon bits in 24 wire bits = 96.5%.
+    Delta opinion = 16 info bits in 16 wire bits = 100% efficiency.
+    These are verified claims from §11.4 claim 6.
+    """
+
+    def test_delta_opinion_100_percent_efficient(self):
+        """Delta opinion: log₂(256) + log₂(256) = 16 bits in 16 wire bits.
+
+        Each signed int8 delta has 256 states = 8 bits of information.
+        Two deltas = 16 bits. Wire cost = 2 bytes = 16 bits. Zero waste.
+        """
+        ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        result = annotation_information_bits(ann)
+        assert math.isclose(result["opinion_info_bits"], 16.0, rel_tol=1e-9)
+        assert result["opinion_wire_bits"] == 16
+        assert math.isclose(result["opinion_efficiency"], 1.0, rel_tol=1e-9)
+
+    def test_delta_tier1_total_96_5_percent(self):
+        """§11.2: 7.170 + 16.000 = 23.170 bits in 24 wire bits = 96.5%."""
+        ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        result = annotation_information_bits(ann)
+        expected_total = (
+            math.log2(3) + math.log2(2) + math.log2(3)
+            + math.log2(2) + math.log2(4) + 16.0
+        )
+        assert math.isclose(
+            result["total_info_bits"], expected_total, rel_tol=1e-9,
+        )
+        assert result["total_wire_bits"] == 24
+        # §11.4 claim 6: 96.5% delta efficiency
+        assert result["bit_efficiency"] > 0.965
+        assert result["bit_efficiency"] < 0.97
+
+    def test_delta_higher_efficiency_than_full_8bit(self):
+        """Delta mode achieves higher bit efficiency than full 8-bit.
+
+        §11.4 claim 6: 96.5% (delta) vs 94.3% (full 8-bit).
+        Both smaller AND higher information density.
+        """
+        full_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(217, 13, 25, 128),
+        )
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        full_result = annotation_information_bits(full_ann)
+        delta_result = annotation_information_bits(delta_ann)
+        assert delta_result["bit_efficiency"] > full_result["bit_efficiency"]
+
+    def test_delta_smaller_wire_than_full(self):
+        """Delta annotation (3 bytes) is smaller than full 8-bit (4 bytes)."""
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        full_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(217, 13, 25, 128),
+        )
+        assert annotation_information_bits(delta_ann)["total_wire_bits"] == 24
+        assert annotation_information_bits(full_ann)["total_wire_bits"] == 32
+
+
+class TestDeltaPayloadComparison:
+    """payload_comparison() with delta annotations."""
+
+    def test_delta_comparison_produces_valid_result(self):
+        """payload_comparison with delta annotation doesn't crash,
+        produces all expected keys."""
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        doc = {"@type": "TemperatureReading", "value": 22.5}
+        result = payload_comparison(doc, delta_ann)
+
+        assert "json_ld_size" in result
+        assert "cbor_ld_ex_size" in result
+        assert "annotation_analysis" in result
+        assert result["cbor_ld_ex_annotation_bit_efficiency"] > 0.96
+
+    def test_delta_cbor_ld_ex_still_smaller(self):
+        """Core thesis holds for delta: CBOR-LD-ex < CBOR-LD for same info."""
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        doc = {"@type": "TemperatureReading", "value": 22.5}
+        result = payload_comparison(doc, delta_ann)
+        assert result["cbor_ld_ex_smaller_than_cbor_ld"] is True
 
 
 class TestPayloadComparison:
