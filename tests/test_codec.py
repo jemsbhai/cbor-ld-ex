@@ -1404,3 +1404,333 @@ class TestCodecEdgeCases:
         assert b_q == 255
         assert d_q == 0
         assert u_q == 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 10. DELTA STREAM INTEGRATION — codec + stream end-to-end
+# ═══════════════════════════════════════════════════════════════════
+
+from cbor_ld_ex.stream import (
+    DeltaStreamDecoder,
+    StreamResult,
+    DeltaWithoutBaselineError,
+    DeltaConstraintError,
+)
+
+
+class TestDeltaStreamIntegration:
+    """Full pipeline: encode → wire → decode → stream decoder → full opinion.
+
+    Verifies that delta annotations survive the complete CBOR-LD-ex
+    wire format and reconstruct correctly through the stateful decoder.
+    This is the end-to-end proof that our efficiency claims (§11.4)
+    hold while maintaining correct semantics.
+    """
+
+    def test_full_then_delta_end_to_end(self):
+        """I-frame → P-frame through full codec + stream decoder."""
+        decoder = DeltaStreamDecoder()
+        doc = {"@type": "TemperatureReading", "value": 22.5}
+
+        # I-frame: full 8-bit opinion
+        full_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(200, 30, 25, 128),
+        )
+        wire_full = encode(doc, full_ann)
+        _, decoded_full = decode(wire_full)
+        r1 = decoder.process(decoded_full)
+
+        assert r1.was_delta is False
+        assert r1.reconstructed == (200, 30, 25, 128)
+
+        # P-frame: delta opinion
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        wire_delta = encode(doc, delta_ann)
+        _, decoded_delta = decode(wire_delta)
+        r2 = decoder.process(decoded_delta)
+
+        assert r2.was_delta is True
+        assert r2.wire_annotation.opinion == (5, -3)  # wire truth
+        assert r2.reconstructed == (205, 27, 23, 128)  # full opinion
+
+    def test_delta_wire_smaller_than_full(self):
+        """Delta message is strictly smaller on the wire.
+
+        §11.5: Tier 1 delta = 3 bytes annotation, full = 4 bytes.
+        The CBOR framing is identical — only the payload shrinks.
+        """
+        doc = {"@type": "TemperatureReading", "value": 22.5}
+
+        full_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(200, 30, 25, 128),
+        )
+        delta_ann = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+
+        wire_full = encode(doc, full_ann)
+        wire_delta = encode(doc, delta_ann)
+        assert len(wire_delta) < len(wire_full)
+
+    def test_axiom3_preserved_through_stream(self):
+        """Axiom 3: b̂ + d̂ + û = 2ⁿ−1 after full pipeline with delta.
+
+        The integer-domain constraint must survive:
+          quantize → encode → wire → decode → stream reconstruct
+        """
+        decoder = DeltaStreamDecoder()
+        doc = {"@type": "Test"}
+
+        # Keyframe
+        kf = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=quantize_binomial(0.85, 0.05, 0.10, 0.50),
+        )
+        _, dec_kf = decode(encode(doc, kf))
+        decoder.process(dec_kf)
+
+        # Delta
+        delta = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(-10, 5),
+        )
+        _, dec_delta = decode(encode(doc, delta))
+        result = decoder.process(dec_delta)
+
+        b, d, u, a = result.reconstructed
+        assert b + d + u == 255
+
+    def test_sequential_deltas_through_codec(self):
+        """Chain of 5 P-frames through full codec, all reconstruct correctly."""
+        decoder = DeltaStreamDecoder()
+        doc = {"@type": "Sensor", "value": 22.5}
+
+        # I-frame
+        kf_opinion = (100, 100, 55, 128)
+        kf = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=kf_opinion,
+        )
+        _, dec = decode(encode(doc, kf))
+        decoder.process(dec)
+
+        # 5 sequential deltas simulating slowly drifting sensor
+        deltas = [(3, -1), (-2, 2), (5, -5), (0, 1), (-1, 0)]
+        expected_b, expected_d = 100, 100
+
+        for delta_b, delta_d in deltas:
+            expected_b += delta_b
+            expected_d += delta_d
+            expected_u = 255 - expected_b - expected_d
+
+            d_ann = Annotation(
+                header=Tier1Header(
+                    compliance_status=ComplianceStatus.COMPLIANT,
+                    delegation_flag=False,
+                    has_opinion=True,
+                    precision_mode=PrecisionMode.DELTA_8,
+                ),
+                opinion=(delta_b, delta_d),
+            )
+            _, dec = decode(encode(doc, d_ann))
+            result = decoder.process(dec)
+
+            assert result.reconstructed == (
+                expected_b, expected_d, expected_u, 128
+            )
+            assert result.reconstructed[0] + result.reconstructed[1] + result.reconstructed[2] == 255
+
+    def test_keyframe_reset_through_codec(self):
+        """New I-frame mid-stream resets baseline through full pipeline."""
+        decoder = DeltaStreamDecoder()
+        doc = {"@type": "Sensor"}
+
+        # I-frame 1
+        kf1 = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(200, 30, 25, 128),
+        )
+        _, dec = decode(encode(doc, kf1))
+        decoder.process(dec)
+
+        # P-frame
+        d1 = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(10, -10),
+        )
+        _, dec = decode(encode(doc, d1))
+        r = decoder.process(dec)
+        assert r.reconstructed == (210, 20, 25, 128)
+
+        # I-frame 2 — new baseline
+        kf2 = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(50, 50, 155, 64),
+        )
+        _, dec = decode(encode(doc, kf2))
+        decoder.process(dec)
+
+        # P-frame on new baseline
+        d2 = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, 5),
+        )
+        _, dec = decode(encode(doc, d2))
+        r = decoder.process(dec)
+        assert r.reconstructed == (55, 55, 145, 64)
+
+    def test_tier2_delta_through_codec(self):
+        """Tier 2 delta through full codec preserves all header fields."""
+        decoder = DeltaStreamDecoder()
+        doc = {"@type": "FusedReading", "sources": 3}
+
+        # Tier 2 I-frame
+        kf = Annotation(
+            header=Tier2Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+                operator_id=OperatorId.TEMPORAL_DECAY,
+                reasoning_context=2,
+                context_version=1,
+                has_multinomial=False,
+                sub_tier_depth=0,
+                source_count=3,
+            ),
+            opinion=(180, 50, 25, 128),
+        )
+        _, dec = decode(encode(doc, kf))
+        decoder.process(dec)
+
+        # Tier 2 P-frame
+        delta = Annotation(
+            header=Tier2Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+                operator_id=OperatorId.TEMPORAL_DECAY,
+                reasoning_context=2,
+                context_version=1,
+                has_multinomial=False,
+                sub_tier_depth=0,
+                source_count=3,
+            ),
+            opinion=(10, -5),
+        )
+        wire = encode(doc, delta)
+        _, dec = decode(wire)
+        r = decoder.process(dec)
+
+        # Header fields preserved
+        assert isinstance(r.wire_annotation.header, Tier2Header)
+        assert r.wire_annotation.header.operator_id == OperatorId.TEMPORAL_DECAY
+        assert r.wire_annotation.header.source_count == 3
+        # Opinion reconstructed
+        assert r.reconstructed == (190, 45, 20, 128)
+
+    def test_delta_with_context_registry(self):
+        """Delta through codec with context compression — full pipeline."""
+        decoder = DeltaStreamDecoder()
+
+        # I-frame with context registry
+        kf = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.BITS_8,
+            ),
+            opinion=(200, 30, 25, 128),
+        )
+        wire = encode(
+            APPENDIX_C_DOC, kf, context_registry=IOT_CONTEXT_REGISTRY,
+        )
+        doc_out, dec = decode(wire, context_registry=IOT_CONTEXT_REGISTRY)
+        decoder.process(dec)
+
+        # Verify data survives
+        assert doc_out["@type"] == "TemperatureReading"
+        assert doc_out["value"] == 22.5
+
+        # P-frame with same registry
+        delta = Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),
+        )
+        wire = encode(
+            APPENDIX_C_DOC, delta, context_registry=IOT_CONTEXT_REGISTRY,
+        )
+        doc_out, dec = decode(wire, context_registry=IOT_CONTEXT_REGISTRY)
+        r = decoder.process(dec)
+
+        assert doc_out["unit"] == "Celsius"
+        assert r.reconstructed == (205, 27, 23, 128)
+        assert r.reconstructed[0] + r.reconstructed[1] + r.reconstructed[2] == 255
