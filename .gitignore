@@ -44,3 +44,17 @@ improvements/
 
 # Generated benchmark output
 demo/output/
+
+# Paper drafts (private, not for public repo)
+papers/
+
+# Erroneous Phase 0 theory drafts (contain fabricated/incorrect constants)
+spec/PHASE0_TURBOQUANT_THEORY.md
+spec/PHASE0_TURBOQUANT_THEORY_v2.md
+spec/PHASE0_TURBOQUANT_THEORY_v3.md
+
+# Backup files
+*.bak
+
+# One-off verification scripts
+verify_syndrome_localization.py
