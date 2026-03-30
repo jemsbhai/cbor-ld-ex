@@ -272,3 +272,67 @@ def fwht_inverse(y: list[float]) -> list[float]:
         Reconstructed vector of length D.
     """
     return fwht(y)
+
+
+# =========================================================================
+# L2 Simplex Projection — §4.8.5 (Duchi et al. 2008)
+#
+# Projects a vector onto the probability simplex:
+#   Δ = {x ∈ ℝ^k : x_i ≥ 0, ∑x_i = 1}
+#
+# This is the L2-nearest point on the simplex to the input vector.
+# Used for constraint restoration after inverse RHT + dequantization.
+#
+# Algorithm (Duchi et al. 2008, "Efficient Projections onto the
+# ℓ1-Ball for Learning in High Dimensions", ICML 2008):
+#   1. Sort components descending
+#   2. Find threshold θ via cumulative sum
+#   3. Shift and clamp: x_proj_i = max(0, x_i - θ)
+#
+# Complexity: O(k log k) from the sort. For k=3 (opinion triples),
+# this is negligible.
+#
+# Properties:
+#   - Output is on the simplex: ∑x_proj_i = 1, x_proj_i ≥ 0
+#   - L2-nearest point (by KKT conditions)
+#   - Idempotent: project(project(x)) = project(x)
+#   - Does not amplify error (Theorem 14): ‖proj - true‖ ≤ ‖noisy - true‖
+# =========================================================================
+
+
+def simplex_project(x: list[float]) -> list[float]:
+    """Project a vector onto the probability simplex (Duchi et al. 2008).
+
+    Finds the L2-nearest point on {v : v_i ≥ 0, ∑v_i = 1}.
+
+    Args:
+        x: Input vector of length k (≥ 1).
+
+    Returns:
+        Projected vector of length k on the probability simplex.
+
+    Raises:
+        ValueError: If input is empty.
+    """
+    k = len(x)
+    if k == 0:
+        raise ValueError("Input must be non-empty")
+    if k == 1:
+        return [1.0]
+
+    # Step 1: Sort descending
+    mu = sorted(x, reverse=True)
+
+    # Step 2: Find the threshold θ
+    # θ = (cumsum_j - 1) / j for the largest j where μ[j] > θ
+    cumsum = 0.0
+    theta = 0.0
+    for j in range(k):
+        cumsum += mu[j]
+        t = (cumsum - 1.0) / (j + 1)
+        if j == k - 1 or mu[j + 1] <= t:
+            theta = t
+            break
+
+    # Step 3: Shift and clamp
+    return [max(0.0, xi - theta) for xi in x]

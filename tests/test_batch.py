@@ -25,6 +25,7 @@ from cbor_ld_ex.batch import (
     splitmix64,
     fwht,
     fwht_inverse,
+    simplex_project,
 )
 
 
@@ -481,3 +482,205 @@ class TestFWHTEdgeCases:
         for i in range(d):
             assert abs(h_combined[i] - expected[i]) < 1e-9 * (abs(expected[i]) + 1e-15), \
                 f"d={d}, i={i}: linearity violated"
+
+
+# =========================================================================
+# L2 Simplex Projection — §4.8.5 (Duchi et al. 2008)
+# =========================================================================
+
+
+class TestSimplexProjectKnownVectors:
+    """Hand-verified projections onto the probability k-simplex.
+
+    The L2 simplex projection finds the closest point on the simplex
+    {x : x_i ≥ 0, ∑x_i = 1} to a given input vector.
+
+    Algorithm: sort descending, find threshold via cumulative sums,
+    shift and clamp. O(k log k) from the sort.
+    """
+
+    def test_already_on_simplex(self):
+        """Point already on simplex is unchanged."""
+        x = [0.3, 0.5, 0.2]
+        result = simplex_project(x)
+        for i in range(3):
+            assert abs(result[i] - x[i]) < 1e-12
+
+    def test_uniform_on_simplex(self):
+        """Uniform distribution [1/3, 1/3, 1/3] is unchanged."""
+        x = [1/3, 1/3, 1/3]
+        result = simplex_project(x)
+        for i in range(3):
+            assert abs(result[i] - 1/3) < 1e-12
+
+    def test_vertex_on_simplex(self):
+        """Vertex [1, 0, 0] is unchanged."""
+        x = [1.0, 0.0, 0.0]
+        result = simplex_project(x)
+        assert abs(result[0] - 1.0) < 1e-12
+        assert abs(result[1] - 0.0) < 1e-12
+        assert abs(result[2] - 0.0) < 1e-12
+
+    def test_needs_scaling_only(self):
+        """[0.4, 0.4, 0.4] sums to 1.2, needs uniform shift down.
+
+        Threshold = (1.2 - 1.0) / 3 = 0.0667
+        Projected: [0.333, 0.333, 0.333]
+        """
+        result = simplex_project([0.4, 0.4, 0.4])
+        for val in result:
+            assert abs(val - 1/3) < 1e-10
+
+    def test_needs_clamping(self):
+        """[0.5, 0.5, -0.5] has a negative component.
+
+        After projection: the negative component gets clamped to 0,
+        and the remaining budget is distributed.
+        Sorted descending: [0.5, 0.5, -0.5]
+        Cumsum: 0.5, 1.0, 0.5
+        k=1: (0.5-1)/1 = -0.5, μ[1]=0.5 > -0.5 → continue
+        k=2: (1.0-1)/2 = 0.0, μ[2]=-0.5 ≤ 0.0 → threshold = 0.0
+        Projected: max(0, 0.5-0) = 0.5, max(0, 0.5-0) = 0.5, max(0, -0.5-0) = 0.0
+        """
+        result = simplex_project([0.5, 0.5, -0.5])
+        assert abs(result[0] - 0.5) < 1e-12
+        assert abs(result[1] - 0.5) < 1e-12
+        assert abs(result[2] - 0.0) < 1e-12
+
+    def test_all_negative(self):
+        """[-1, -2, -3]: all negative, projected to vertex nearest to input.
+
+        The closest simplex point to a vector where all components are
+        negative is the vertex with mass on the least-negative component.
+        Result: [1, 0, 0]
+        """
+        result = simplex_project([-1.0, -2.0, -3.0])
+        assert abs(result[0] - 1.0) < 1e-12
+        assert abs(result[1] - 0.0) < 1e-12
+        assert abs(result[2] - 0.0) < 1e-12
+
+    def test_all_equal_large(self):
+        """[10, 10, 10]: uniform, far from simplex.
+
+        Threshold = (30 - 1) / 3 = 29/3 ≈ 9.667
+        Projected: [10 - 29/3] = [1/3, 1/3, 1/3]
+        """
+        result = simplex_project([10.0, 10.0, 10.0])
+        for val in result:
+            assert abs(val - 1/3) < 1e-10
+
+    def test_2d_simplex(self):
+        """2D case: [0.8, 0.8] → [0.5, 0.5]."""
+        result = simplex_project([0.8, 0.8])
+        assert abs(result[0] - 0.5) < 1e-12
+        assert abs(result[1] - 0.5) < 1e-12
+
+    def test_1d_simplex(self):
+        """1D case: any scalar projects to [1.0]."""
+        assert abs(simplex_project([5.0])[0] - 1.0) < 1e-12
+        assert abs(simplex_project([-3.0])[0] - 1.0) < 1e-12
+        assert abs(simplex_project([1.0])[0] - 1.0) < 1e-12
+
+    def test_opinion_triple_restoration(self):
+        """Realistic case: noisy opinion triple after inverse RHT.
+
+        (b̃, d̃, ũ) = (0.36, 0.27, 0.42) sums to 1.05.
+        After projection must sum to exactly 1.0 with all ≥ 0.
+        """
+        result = simplex_project([0.36, 0.27, 0.42])
+        assert abs(sum(result) - 1.0) < 1e-12
+        assert all(v >= -1e-15 for v in result)
+
+
+class TestSimplexProjectProperties:
+    """Mathematical properties of L2 simplex projection."""
+
+    def test_output_on_simplex(self):
+        """Output always satisfies simplex constraints."""
+        import random
+        random.seed(42)
+        for _ in range(200):
+            k = random.randint(2, 10)
+            x = [random.gauss(0, 2) for _ in range(k)]
+            result = simplex_project(x)
+            assert abs(sum(result) - 1.0) < 1e-10, \
+                f"Sum = {sum(result)}, expected 1.0"
+            for i, v in enumerate(result):
+                assert v >= -1e-12, \
+                    f"Component {i} = {v} < 0"
+
+    def test_idempotent(self):
+        """project(project(x)) = project(x) — projection is idempotent."""
+        import random
+        random.seed(42)
+        for _ in range(100):
+            x = [random.gauss(0, 2) for _ in range(5)]
+            p1 = simplex_project(x)
+            p2 = simplex_project(p1)
+            for i in range(5):
+                assert abs(p1[i] - p2[i]) < 1e-12
+
+    def test_nearest_point(self):
+        """Projection is the L2-nearest simplex point.
+
+        For any other simplex point z, ‖proj - x‖ ≤ ‖z - x‖.
+        We test against 100 random simplex points.
+        """
+        import random
+        random.seed(42)
+        x = [0.5, -0.3, 1.2, 0.1, -0.1]
+        proj = simplex_project(x)
+        dist_proj = math.sqrt(sum((p - xi)**2 for p, xi in zip(proj, x)))
+
+        for _ in range(100):
+            # Generate random simplex point via Dirichlet
+            raw = [random.expovariate(1.0) for _ in range(5)]
+            total = sum(raw)
+            z = [r / total for r in raw]
+            dist_z = math.sqrt(sum((zi - xi)**2 for zi, xi in zip(z, x)))
+            assert dist_proj <= dist_z + 1e-9, \
+                f"Projection is not nearest: d(proj)={dist_proj}, d(z)={dist_z}"
+
+    @given(
+        b=st.floats(min_value=-2.0, max_value=2.0),
+        d=st.floats(min_value=-2.0, max_value=2.0),
+        u=st.floats(min_value=-2.0, max_value=2.0),
+    )
+    @settings(max_examples=300)
+    def test_opinion_projection_always_valid(self, b, d, u):
+        """Property: projection of any (b,d,u) triple produces a valid opinion.
+
+        This is the constraint restoration guarantee from §4.8.5.
+        """
+        assume(math.isfinite(b) and math.isfinite(d) and math.isfinite(u))
+        result = simplex_project([b, d, u])
+        assert abs(sum(result) - 1.0) < 1e-10
+        assert all(v >= -1e-12 for v in result)
+
+    def test_does_not_amplify_error(self):
+        """Theorem 14: projection does not increase distance to true point.
+
+        For a true simplex point x_true and noisy x̃ = x_true + noise:
+          ‖project(x̃) - x_true‖ ≤ ‖x̃ - x_true‖
+        """
+        import random
+        random.seed(42)
+        for _ in range(200):
+            # Generate true simplex point
+            raw = [random.expovariate(1.0) for _ in range(3)]
+            total = sum(raw)
+            x_true = [r / total for r in raw]
+
+            # Add noise
+            noise = [random.gauss(0, 0.1) for _ in range(3)]
+            x_noisy = [t + n for t, n in zip(x_true, noise)]
+
+            # Project
+            x_proj = simplex_project(x_noisy)
+
+            # Distance comparison
+            dist_noisy = math.sqrt(sum((n - t)**2 for n, t in zip(x_noisy, x_true)))
+            dist_proj = math.sqrt(sum((p - t)**2 for p, t in zip(x_proj, x_true)))
+
+            assert dist_proj <= dist_noisy + 1e-10, \
+                f"Projection amplified error: {dist_proj} > {dist_noisy}"
