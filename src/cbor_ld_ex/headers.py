@@ -50,11 +50,11 @@ class ComplianceStatus(IntEnum):
 
 
 class PrecisionMode(IntEnum):
-    """Table 1: 2-bit precision mode selector."""
+    """Table 1: 2-bit precision mode selector (v0.4.0+: mode 11 = delta)."""
     BITS_8 = 0b00
     BITS_16 = 0b01
     BITS_32 = 0b10
-    RESERVED = 0b11
+    DELTA_8 = 0b11
 
 
 class OperatorId(IntEnum):
@@ -72,6 +72,19 @@ class OperatorId(IntEnum):
     EXPIRY_TRIGGER = 0b1010
     REVIEW_TRIGGER = 0b1011
     REGULATORY_CHANGE = 0b1100
+
+
+def opinion_payload_size(mode: PrecisionMode) -> int:
+    """Return the opinion payload size in bytes for a given precision mode.
+
+    Per Table 1 (§4.3) and §7.6:
+      - BITS_8 (00):  3 bytes (b̂, d̂, â)
+      - BITS_16 (01): 6 bytes
+      - BITS_32 (10): 12 bytes (float32 × 3)
+      - DELTA_8 (11): 2 bytes (Δb̂, Δd̂) — â unchanged from previous
+    """
+    return {PrecisionMode.BITS_8: 3, PrecisionMode.BITS_16: 6,
+            PrecisionMode.BITS_32: 12, PrecisionMode.DELTA_8: 2}[mode]
 
 
 # Origin tier codes (2-bit field, bits 3-4 of byte 0)

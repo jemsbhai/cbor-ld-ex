@@ -527,3 +527,63 @@ class TestOperatorIdTable:
         """13 operators defined (0000–1100), 1101–1110 reserved, 1111 extension."""
         # We define the 13 non-reserved operators as enum members
         assert len(OperatorId) >= 13
+
+
+# ---------------------------------------------------------------------------
+# 6. Delta mode — precision_mode=11 (§5.1, §7.6)
+# ---------------------------------------------------------------------------
+
+class TestDeltaMode:
+    """precision_mode=11 is 8-bit delta mode, NOT reserved (v0.4.0+)."""
+
+    def test_delta_8_enum_value(self):
+        """PrecisionMode.DELTA_8 must have value 0b11."""
+        assert PrecisionMode.DELTA_8 == 0b11
+
+    def test_delta_8_replaces_reserved(self):
+        """RESERVED should no longer exist as a PrecisionMode member."""
+        assert not hasattr(PrecisionMode, 'RESERVED')
+
+    def test_delta_8_roundtrip_tier1(self):
+        """Delta mode roundtrips through Tier 1 header."""
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        data = encode_header(header)
+        decoded = decode_header(data)
+        assert decoded.precision_mode == PrecisionMode.DELTA_8
+
+    def test_delta_8_bit_pattern(self):
+        """Delta mode sets bits 1-0 of byte 0 to 11.
+
+        Header: [cs=00][df=0][ot=00][ho=1][pm=11] = 0b00000111 = 0x07
+        """
+        header = Tier1Header(
+            compliance_status=ComplianceStatus.COMPLIANT,
+            delegation_flag=False,
+            has_opinion=True,
+            precision_mode=PrecisionMode.DELTA_8,
+        )
+        data = encode_header(header)
+        assert data == bytes([0b00_0_00_1_11])
+
+    def test_opinion_payload_size_delta(self):
+        """Delta mode payload is 2 bytes (Δb̂, Δd̂) per §7.6."""
+        from cbor_ld_ex.headers import opinion_payload_size
+        assert opinion_payload_size(PrecisionMode.DELTA_8) == 2
+
+    def test_opinion_payload_size_full_modes(self):
+        """Full modes: 8-bit=3, 16-bit=6, 32-bit=12 bytes."""
+        from cbor_ld_ex.headers import opinion_payload_size
+        assert opinion_payload_size(PrecisionMode.BITS_8) == 3
+        assert opinion_payload_size(PrecisionMode.BITS_16) == 6
+        assert opinion_payload_size(PrecisionMode.BITS_32) == 12
+
+    def test_all_four_precision_modes_valid(self):
+        """All 4 precision modes are defined — no wasted 2-bit states."""
+        assert len(PrecisionMode) == 4
+        codes = {m.value for m in PrecisionMode}
+        assert codes == {0b00, 0b01, 0b10, 0b11}
