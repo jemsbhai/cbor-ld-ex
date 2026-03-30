@@ -35,7 +35,15 @@ from cbor_ld_ex.annotations import Annotation, encode_annotation
 from cbor_ld_ex.codec import (
     ContextRegistry,
     annotation_information_bits,
+    provenance_block_information_bits,
     ANNOTATION_TERM_ID,
+)
+from cbor_ld_ex.security import (
+    ProvenanceEntry,
+    CHAIN_ORIGIN_SENTINEL,
+    AUDIT_CHAIN_ORIGIN_SENTINEL,
+    encode_provenance_entry,
+    compute_entry_digest,
 )
 from cbor_ld_ex.headers import (
     Tier1Header,
@@ -933,3 +941,124 @@ def format_csv(suite: BenchmarkSuite) -> str:
         ])
 
     return output.getvalue()
+
+
+# =====================================================================
+# Provenance Chain Analysis — §4.7.5 correction block efficiency
+#
+# Separate from the annotation benchmark matrix. Provenance chains
+# are Tier 3 extension blocks — they have their own efficiency
+# characteristics and claims that must be independently verified.
+# =====================================================================
+
+def _make_provenance_chain(
+    length: int,
+    corrected_indices: set | None = None,
+    audit_grade: bool = False,
+) -> list[ProvenanceEntry]:
+    """Build a valid provenance chain of given length.
+
+    Uses realistic operator cycling (mod 13) and incrementing
+    timestamps. Corrected entries get correction bits (1, 0, 1)
+    as a representative pattern.
+    """
+    sentinel = AUDIT_CHAIN_ORIGIN_SENTINEL if audit_grade else CHAIN_ORIGIN_SENTINEL
+    corrected = corrected_indices or set()
+    entries = []
+    prev = sentinel
+    for i in range(length):
+        has_corr = i in corrected
+        e = ProvenanceEntry(
+            origin_tier=i % 3,          # cycle through tiers
+            operator_id=i % 13,         # cycle through all operators
+            precision_mode=0,           # always 8-bit (§9.4)
+            b_q=200 - (i % 50),         # varying but valid
+            d_q=30 + (i % 50),
+            a_q=128,
+            timestamp=1710230400 + i * 60,  # 1-minute intervals
+            prev_digest=prev,
+            has_correction=has_corr,
+            c_b=1 if has_corr else 0,
+            c_d=0,
+            c_a=1 if has_corr else 0,
+        )
+        entry_bytes = encode_provenance_entry(e, audit_grade=audit_grade)
+        prev = compute_entry_digest(entry_bytes, audit_grade=audit_grade)
+        entries.append(e)
+    return entries
+
+
+def build_provenance_configs() -> list[tuple[str, list[ProvenanceEntry], bool]]:
+    """Build provenance chain configurations for benchmarking.
+
+    Returns list of (label, entries, audit_grade) tuples covering:
+      - Chain lengths: 1, 3, 5, 10
+      - Correction ratios: none, partial, all
+      - Audit grade: standard (16-byte) and audit (24-byte)
+
+    Labels encode dimensions: L{length}-{correction}-{grade}
+    """
+    configs = []
+
+    # Standard grade, varying length and correction ratio
+    for length in [1, 3, 5, 10]:
+        # No corrections
+        configs.append((
+            f"L{length}-nocorr-std",
+            _make_provenance_chain(length),
+            False,
+        ))
+        # All corrections
+        configs.append((
+            f"L{length}-allcorr-std",
+            _make_provenance_chain(length, corrected_indices=set(range(length))),
+            False,
+        ))
+
+    # Partial corrections (odd-indexed entries)
+    for length in [3, 5, 10]:
+        partial = {i for i in range(length) if i % 2 == 1}
+        configs.append((
+            f"L{length}-partial-std",
+            _make_provenance_chain(length, corrected_indices=partial),
+            False,
+        ))
+
+    # Audit grade
+    for length in [3, 10]:
+        configs.append((
+            f"L{length}-nocorr-audit",
+            _make_provenance_chain(length, audit_grade=True),
+            True,
+        ))
+        configs.append((
+            f"L{length}-allcorr-audit",
+            _make_provenance_chain(
+                length,
+                corrected_indices=set(range(length)),
+                audit_grade=True,
+            ),
+            True,
+        ))
+
+    return configs
+
+
+def run_provenance_analysis(
+    configs: list[tuple[str, list[ProvenanceEntry], bool]],
+) -> list[tuple[str, dict]]:
+    """Run Shannon analysis over all provenance configs.
+
+    Args:
+        configs: Output of build_provenance_configs().
+
+    Returns:
+        List of (label, analysis_dict) tuples.
+    """
+    results = []
+    for label, entries, audit_grade in configs:
+        analysis = provenance_block_information_bits(
+            entries, audit_grade=audit_grade,
+        )
+        results.append((label, analysis))
+    return results

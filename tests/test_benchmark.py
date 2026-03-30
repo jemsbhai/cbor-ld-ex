@@ -64,6 +64,9 @@ from cbor_ld_ex_benchmark import (
     format_markdown_table,
     format_latex_table,
     format_csv,
+    # Provenance analysis (§4.7.5)
+    build_provenance_configs,
+    run_provenance_analysis,
 )
 
 # Dependencies from existing codebase
@@ -93,6 +96,7 @@ from cbor_ld_ex.temporal import (
     TRIGGER_REVIEW_DUE,
 )
 from cbor_ld_ex.transport import full_benchmark
+from cbor_ld_ex.codec import provenance_block_information_bits
 
 # jsonld-ex baselines
 from jsonld_ex.cbor_ld import to_cbor as jex_to_cbor
@@ -1055,3 +1059,158 @@ def _build_cbor_annotation_dict(ann: Annotation) -> dict:
         result[4] = header.source_count
 
     return result
+
+
+# =========================================================================
+# Section 7: PROVENANCE CHAIN ANALYSIS (§4.7.5)
+# =========================================================================
+
+# Lazy cache for provenance analysis
+_PROV_ANALYSIS = None
+
+
+def _get_prov_analysis():
+    """Lazily build and cache the provenance analysis."""
+    global _PROV_ANALYSIS
+    if _PROV_ANALYSIS is None:
+        configs = build_provenance_configs()
+        _PROV_ANALYSIS = run_provenance_analysis(configs)
+    return _PROV_ANALYSIS
+
+
+class TestProvenanceConfigs:
+    """Tests for build_provenance_configs()."""
+
+    def test_returns_non_empty_list(self):
+        configs = build_provenance_configs()
+        assert len(configs) > 0
+
+    def test_unique_labels(self):
+        configs = build_provenance_configs()
+        labels = [c[0] for c in configs]
+        assert len(labels) == len(set(labels)), f"Duplicate labels: {labels}"
+
+    def test_covers_chain_lengths(self):
+        """Must cover L=1, L=3, L=5, L=10."""
+        configs = build_provenance_configs()
+        lengths = set()
+        for label, entries, audit in configs:
+            lengths.add(len(entries))
+        for required_len in [1, 3, 5, 10]:
+            assert required_len in lengths, f"Missing chain length L={required_len}"
+
+    def test_covers_correction_ratios(self):
+        """Must cover 0%, partial, and 100% correction."""
+        configs = build_provenance_configs()
+        ratios = set()
+        for label, entries, audit in configs:
+            if not entries:
+                continue
+            n_corr = sum(1 for e in entries if e.has_correction)
+            if n_corr == 0:
+                ratios.add("none")
+            elif n_corr == len(entries):
+                ratios.add("all")
+            else:
+                ratios.add("partial")
+        assert "none" in ratios
+        assert "partial" in ratios
+        assert "all" in ratios
+
+    def test_covers_audit_grade(self):
+        """Must include at least one audit-grade config."""
+        configs = build_provenance_configs()
+        has_audit = any(audit for _, _, audit in configs)
+        assert has_audit
+
+
+class TestProvenanceScientificInvariants:
+    """Universal claims about provenance efficiency, verified over ALL configs.
+
+    Failure means the paper's claim must be retracted or qualified.
+    """
+
+    def test_standard_entry_efficiency_above_97_all_configs(self):
+        """Claim: standard provenance entry bit efficiency > 97%.
+
+        125.291 / 128 = 97.88%. Verified over all standard configs.
+        """
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            if result["per_entry_wire_bits"] == 128:  # standard
+                assert result["per_entry_efficiency"] > 0.97, \
+                    f"FALSIFIED: {label}: entry efficiency " \
+                    f"{result['per_entry_efficiency']:.4f} <= 0.97"
+
+    def test_audit_entry_efficiency_above_98_all_configs(self):
+        """Claim: audit-grade provenance entry bit efficiency > 98%.
+
+        189.291 / 192 = 98.59%. Verified over all audit configs.
+        """
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            if result["per_entry_wire_bits"] == 192:  # audit
+                assert result["per_entry_efficiency"] > 0.98, \
+                    f"FALSIFIED: {label}: audit entry efficiency " \
+                    f"{result['per_entry_efficiency']:.4f} <= 0.98"
+
+    def test_correction_overhead_bounded(self):
+        """Claim: correction overhead ≤ 6% for all configs.
+
+        Worst case: L=1 all-corrected = 8/136 = 5.88% (3 info bits
+        padded to 8 wire bits). The overhead follows a sawtooth
+        pattern due to byte-boundary padding — it jumps whenever
+        L×3 crosses a byte boundary:
+          L=1: 5.88%, L=2: 3.03%, L=3: 4.08%, L=5: 2.47%,
+          L=6: 3.09%, L=8: 2.33%, L=10: 2.48%
+        Universal bound: ≤6%. Converges toward ~2.5% for large L.
+        """
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            if result["num_corrected"] > 0:
+                baseline = (
+                    result["chain_length_wire_bits"]
+                    + result["num_entries"] * result["per_entry_wire_bits"]
+                )
+                overhead_pct = result["correction_wire_bits"] / baseline * 100
+                assert overhead_pct <= 6.0, \
+                    f"FALSIFIED: {label}: correction overhead " \
+                    f"{overhead_pct:.2f}% > 6.0%"
+
+    def test_information_never_exceeds_wire_bits(self):
+        """Physical law: Shannon info ≤ wire bits for all provenance blocks."""
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            assert result["total_info_bits"] <= result["total_wire_bits"] + 1e-9, \
+                f"FALSIFIED: {label}: info ({result['total_info_bits']:.2f}) " \
+                f"> wire ({result['total_wire_bits']})"
+
+    def test_zero_correction_zero_overhead(self):
+        """Invariant: when no entries are corrected, correction overhead is exactly 0."""
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            if result["num_corrected"] == 0:
+                assert result["correction_wire_bits"] == 0, \
+                    f"FALSIFIED: {label}: zero corrections but " \
+                    f"correction_wire_bits={result['correction_wire_bits']}"
+                assert result["correction_pad_bits"] == 0
+
+    def test_block_efficiency_above_94_all_configs(self):
+        """Total block bit efficiency > 94% for all configs.
+
+        Worst case: L=1 all-corrected = 136.291/144 = 94.65%.
+        For L≥3, efficiency is always > 96% because correction pad
+        waste amortizes across entries.
+        """
+        analysis = _get_prov_analysis()
+        for label, result in analysis:
+            if result["num_entries"] > 0:
+                # Universal bound
+                assert result["bit_efficiency"] > 0.94, \
+                    f"FALSIFIED: {label}: block efficiency " \
+                    f"{result['bit_efficiency']:.4f} <= 0.94"
+                # Tighter bound for L≥3
+                if result["num_entries"] >= 3:
+                    assert result["bit_efficiency"] > 0.96, \
+                        f"FALSIFIED: {label}: L≥3 block efficiency " \
+                        f"{result['bit_efficiency']:.4f} <= 0.96"
