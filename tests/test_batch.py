@@ -23,6 +23,8 @@ from hypothesis import strategies as st
 from cbor_ld_ex.batch import (
     Xoshiro128PlusPlus,
     splitmix64,
+    fwht,
+    fwht_inverse,
 )
 
 
@@ -299,3 +301,183 @@ class TestXoshiro128PPProperties:
             for _ in range(20):
                 val = rng.next_bits(n)
                 assert 0 <= val < (1 << n), f"n={n}: got {val}"
+
+
+# =========================================================================
+# Fast Walsh-Hadamard Transform (FWHT) — §4.8.3
+# =========================================================================
+
+import math
+
+
+class TestFWHTKnownVectors:
+    """Known small-case transforms verified by hand.
+
+    The normalized Walsh-Hadamard matrix of order D:
+      H_D[i,j] = (1/√D) × (-1)^<i,j>
+    where <i,j> is the bitwise dot product.
+
+    H_2 = (1/√2) [[1, 1], [1, -1]]
+    H_4 = (1/2) [[1,1,1,1],[1,-1,1,-1],[1,1,-1,-1],[1,-1,-1,1]]
+    """
+
+    def test_d2_identity_vector(self):
+        """H_2 · [1, 0] = [1/√2, 1/√2]."""
+        result = fwht([1.0, 0.0])
+        s = 1.0 / math.sqrt(2)
+        assert len(result) == 2
+        assert abs(result[0] - s) < 1e-12
+        assert abs(result[1] - s) < 1e-12
+
+    def test_d2_unit_vector(self):
+        """H_2 · [1, 1] = [√2, 0]."""
+        result = fwht([1.0, 1.0])
+        s2 = math.sqrt(2)
+        assert abs(result[0] - s2) < 1e-12
+        assert abs(result[1] - 0.0) < 1e-12
+
+    def test_d4_known(self):
+        """H_4 · [1, 0, 0, 0] = [0.5, 0.5, 0.5, 0.5]."""
+        result = fwht([1.0, 0.0, 0.0, 0.0])
+        for val in result:
+            assert abs(val - 0.5) < 1e-12
+
+    def test_d4_alternating(self):
+        """H_4 · [1, -1, 1, -1] = [0, 0, 0, 2].
+
+        The pattern [1,-1,1,-1] is the 3rd Walsh function (bit reversal
+        of index 3 = 0b11), so the transform concentrates at index 3.
+        Wait — let me verify: H_4[i,j] = (1/2)(-1)^<i,j>.
+        Column 0: <i,0>=0 for all i, so H_4[:,0] = [1,1,1,1]/2.
+        Input [1,-1,1,-1]: sum = 1*1 + (-1)*(-1) + 1*1 + (-1)*(-1) for row with
+        matching sign pattern.
+
+        Actually, the normalized result of H_4 · [1,-1,1,-1]:
+        Row 0: (1+(-1)+1+(-1))/2 = 0
+        Row 1: (1-(-1)+1-(-1))/2 = (1+1+1+1)/2 = 2
+        Row 2: (1+(-1)-1-(-1))/2 = (1-1-1+1)/2 = 0
+        Row 3: (1-(-1)-1+(-1))/2 = (1+1-1-1)/2 = 0
+        Result: [0, 2, 0, 0]
+        """
+        result = fwht([1.0, -1.0, 1.0, -1.0])
+        assert abs(result[0] - 0.0) < 1e-12
+        assert abs(result[1] - 2.0) < 1e-12
+        assert abs(result[2] - 0.0) < 1e-12
+        assert abs(result[3] - 0.0) < 1e-12
+
+
+class TestFWHTSelfInverse:
+    """Normalized FWHT is self-inverse: H · H · x = x.
+
+    This is THE critical property for batch encode/decode roundtrip.
+    If this fails, the inverse RHT won't recover the original vector.
+    """
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 16, 32, 64, 128, 256])
+    def test_roundtrip_unit_vector(self, d):
+        """fwht(fwht([1,0,...,0])) = [1,0,...,0] for all power-of-2 sizes."""
+        x = [0.0] * d
+        x[0] = 1.0
+        y = fwht(x)
+        z = fwht(y)
+        for i in range(d):
+            assert abs(z[i] - x[i]) < 1e-10, \
+                f"d={d}, i={i}: expected {x[i]}, got {z[i]}"
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 16, 32, 64, 128, 256])
+    def test_roundtrip_random_vector(self, d):
+        """fwht(fwht(x)) = x for random vectors at all sizes."""
+        import random
+        random.seed(42 + d)
+        x = [random.gauss(0, 1) for _ in range(d)]
+        y = fwht(x)
+        z = fwht(y)
+        for i in range(d):
+            assert abs(z[i] - x[i]) < 1e-9, \
+                f"d={d}, i={i}: expected {x[i]:.10f}, got {z[i]:.10f}"
+
+    def test_inverse_function_matches(self):
+        """fwht_inverse(fwht(x)) = x using the explicit inverse function."""
+        import random
+        random.seed(99)
+        x = [random.gauss(0, 1) for _ in range(64)]
+        y = fwht(x)
+        z = fwht_inverse(y)
+        for i in range(64):
+            assert abs(z[i] - x[i]) < 1e-9
+
+
+class TestFWHTOrthogonality:
+    """Normalized FWHT preserves L2 norm: ‖H·x‖₂ = ‖x‖₂.
+
+    This is Parseval's theorem for the Walsh-Hadamard transform.
+    Critical for distortion-rate analysis: the MSE in the rotated
+    domain equals the MSE in the original domain.
+    """
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 16, 64, 256])
+    def test_norm_preservation(self, d):
+        """L2 norm is preserved after transform."""
+        import random
+        random.seed(42 + d)
+        x = [random.gauss(0, 1) for _ in range(d)]
+        y = fwht(x)
+        norm_x = math.sqrt(sum(v**2 for v in x))
+        norm_y = math.sqrt(sum(v**2 for v in y))
+        assert abs(norm_x - norm_y) < 1e-9 * norm_x, \
+            f"d={d}: norm_x={norm_x:.10f}, norm_y={norm_y:.10f}"
+
+    def test_zero_vector(self):
+        """H · 0 = 0."""
+        result = fwht([0.0] * 16)
+        for val in result:
+            assert abs(val) < 1e-15
+
+
+class TestFWHTEdgeCases:
+    """Edge cases and input validation."""
+
+    def test_d1_passthrough(self):
+        """D=1: H_1 = [1], so transform is identity."""
+        result = fwht([3.14])
+        assert abs(result[0] - 3.14) < 1e-12
+
+    def test_non_power_of_2_rejected(self):
+        """Non-power-of-2 lengths must be rejected."""
+        with pytest.raises(ValueError, match="power of 2"):
+            fwht([1.0, 2.0, 3.0])
+
+    def test_empty_rejected(self):
+        """Empty input must be rejected."""
+        with pytest.raises(ValueError):
+            fwht([])
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 16, 32, 64, 128, 256])
+    def test_output_length_equals_input(self, d):
+        """Output has same length as input."""
+        x = [1.0] * d
+        y = fwht(x)
+        assert len(y) == d
+
+    @given(
+        d_exp=st.integers(min_value=0, max_value=8),
+    )
+    @settings(max_examples=9)
+    def test_linearity(self, d_exp):
+        """H · (ax + by) = a(H·x) + b(H·y) — linearity."""
+        import random
+        d = 1 << d_exp
+        random.seed(42 + d)
+        x = [random.gauss(0, 1) for _ in range(d)]
+        y = [random.gauss(0, 1) for _ in range(d)]
+        a, b = 2.5, -1.3
+        combined = [a * xi + b * yi for xi, yi in zip(x, y)]
+
+        hx = fwht(x)
+        hy = fwht(y)
+        h_combined = fwht(combined)
+        expected = [a * hxi + b * hyi for hxi, hyi in zip(hx, hy)]
+
+        for i in range(d):
+            assert abs(h_combined[i] - expected[i]) < 1e-9 * (abs(expected[i]) + 1e-15), \
+                f"d={d}, i={i}: linearity violated"

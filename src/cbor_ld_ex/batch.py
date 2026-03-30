@@ -176,3 +176,99 @@ class Xoshiro128PlusPlus:
             uint in [0, 2^n − 1].
         """
         return self.next() >> (32 - n)
+
+
+# =========================================================================
+# Fast Walsh-Hadamard Transform (FWHT) — §4.8.3
+#
+# The normalized Walsh-Hadamard matrix of order D = 2^k:
+#   H_D[i,j] = (1/√D) × (-1)^<i,j>
+# where <i,j> is the bitwise dot product of the binary representations
+# of i and j.
+#
+# Properties:
+#   - Self-inverse: H · H · x = x (when normalized by 1/√D)
+#   - Orthogonal: preserves L2 norm (‖H·x‖₂ = ‖x‖₂)
+#   - O(D log D) via butterfly decomposition
+#   - No matrix storage — the transform is implicit
+#
+# The butterfly algorithm computes the unnormalized transform in-place,
+# then scales by 1/√D. For D=256 (N=50 sensors): 2048 add/sub + 256 mul.
+# =========================================================================
+
+import math as _math
+
+
+def _is_power_of_2(n: int) -> bool:
+    """Check if n is a positive power of 2."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def fwht(x: list[float]) -> list[float]:
+    """Normalized Fast Walsh-Hadamard Transform.
+
+    Computes y = H_D · x where H_D is the normalized Hadamard matrix
+    of order D = len(x). D must be a power of 2.
+
+    The transform is self-inverse: fwht(fwht(x)) = x.
+
+    Algorithm: in-place butterfly with O(D log D) additions/subtractions,
+    followed by scaling by 1/√D.
+
+    Args:
+        x: Input vector of length D (must be a power of 2).
+
+    Returns:
+        Transformed vector of length D.
+
+    Raises:
+        ValueError: If len(x) is 0 or not a power of 2.
+    """
+    d = len(x)
+    if d == 0:
+        raise ValueError("Input must be non-empty")
+    if not _is_power_of_2(d):
+        raise ValueError(
+            f"Input length must be a power of 2, got {d}"
+        )
+
+    # Work on a copy to avoid mutating input
+    y = list(x)
+
+    # Butterfly: log2(D) stages
+    half = 1
+    while half < d:
+        step = half * 2
+        for j in range(0, d, step):
+            for i in range(half):
+                a = y[j + i]
+                b = y[j + i + half]
+                y[j + i] = a + b
+                y[j + i + half] = a - b
+        half = step
+
+    # Normalize by 1/√D
+    norm = 1.0 / _math.sqrt(d)
+    for i in range(d):
+        y[i] *= norm
+
+    return y
+
+
+def fwht_inverse(y: list[float]) -> list[float]:
+    """Inverse normalized Fast Walsh-Hadamard Transform.
+
+    Since the normalized FWHT is self-inverse (H = H⁻¹),
+    this is identical to the forward transform.
+
+    Provided as a separate function for API clarity — callers
+    can express intent ("I'm inverting") without knowing the
+    self-inverse property.
+
+    Args:
+        y: Transformed vector of length D (must be a power of 2).
+
+    Returns:
+        Reconstructed vector of length D.
+    """
+    return fwht(y)
