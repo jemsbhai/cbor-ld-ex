@@ -221,6 +221,7 @@ class TestAnnotationConfigs:
         assert PrecisionMode.BITS_8 in precisions, "Missing 8-bit configs"
         assert PrecisionMode.BITS_16 in precisions, "Missing 16-bit configs"
         assert PrecisionMode.BITS_32 in precisions, "Missing 32-bit configs"
+        assert PrecisionMode.DELTA_8 in precisions, "Missing delta configs"
 
     def test_covers_all_compliance_statuses(self):
         configs = build_annotation_configs()
@@ -666,13 +667,18 @@ class TestScientificInvariants:
                 continue
 
             header_size = 1 if isinstance(ann.header, Tier1Header) else 4
-            precision_map = {
-                PrecisionMode.BITS_8: 1,
-                PrecisionMode.BITS_16: 2,
-                PrecisionMode.BITS_32: 4,
-            }
-            value_bytes = precision_map[ann.header.precision_mode]
-            opinion_wire_size = 3 * value_bytes  # NOT 4
+
+            if ann.header.precision_mode == PrecisionMode.DELTA_8:
+                # Delta: 2 bytes (Δb̂, Δd̂). No û, no â on wire.
+                opinion_wire_size = 2
+            else:
+                precision_map = {
+                    PrecisionMode.BITS_8: 1,
+                    PrecisionMode.BITS_16: 2,
+                    PrecisionMode.BITS_32: 4,
+                }
+                value_bytes = precision_map[ann.header.precision_mode]
+                opinion_wire_size = 3 * value_bytes  # NOT 4 — û never on wire
 
             raw = encode_annotation(ann)
             ext_size = 0
@@ -684,8 +690,8 @@ class TestScientificInvariants:
             assert len(raw) == expected_size, \
                 f"FALSIFIED: {result.scenario.label}: " \
                 f"wire size {len(raw)} != expected {expected_size} " \
-                f"(header={header_size}, opinion=3×{value_bytes}, ext={ext_size}). " \
-                f"û may be on wire!"
+                f"(header={header_size}, opinion={opinion_wire_size}, ext={ext_size}). " \
+                f"Unexpected bytes on wire!"
 
 
 # =========================================================================
@@ -1023,19 +1029,23 @@ def _build_cbor_annotation_dict(ann: Annotation) -> dict:
     result = {0: int(ann.header.compliance_status)}
 
     if ann.header.has_opinion and ann.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[ann.header.precision_mode]
-        if precision == 32:
-            b, d, u, a = ann.opinion
+        if ann.header.precision_mode == PrecisionMode.DELTA_8:
+            delta_b, delta_d = ann.opinion
+            result[1] = {0: delta_b, 1: delta_d}
         else:
-            b, d, u, a = dequantize_binomial(
-                *ann.opinion, precision=precision,
-            )
-        result[1] = {0: b, 1: d, 2: u, 3: a}
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[ann.header.precision_mode]
+            if precision == 32:
+                b, d, u, a = ann.opinion
+            else:
+                b, d, u, a = dequantize_binomial(
+                    *ann.opinion, precision=precision,
+                )
+            result[1] = {0: b, 1: d, 2: u, 3: a}
 
     header = ann.header
     if isinstance(header, (Tier2Header, Tier3Header)):

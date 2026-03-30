@@ -183,6 +183,11 @@ def derive_qos(doc: dict, annotation: Annotation) -> int:
     if not annotation.header.has_opinion or annotation.opinion is None:
         return 1  # Default
 
+    # Delta mode (§7.6): cannot compute projected probability without
+    # receiver state. Default to QoS 1 — same as no-opinion case.
+    if annotation.header.precision_mode == PrecisionMode.DELTA_8:
+        return 1
+
     # Compute projected probability
     precision_map = {
         PrecisionMode.BITS_8: 8,
@@ -294,24 +299,33 @@ def _annotation_to_jsonld_dict(annotation: Annotation) -> dict:
     )
 
     if annotation.header.has_opinion and annotation.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[annotation.header.precision_mode]
-
-        if precision == 32:
-            b, d, u, a = annotation.opinion
+        if annotation.header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode (§7.6): report raw deltas — no dequantization
+            # without previous state.
+            delta_b, delta_d = annotation.opinion
+            result["opinion"] = {
+                "delta_belief": delta_b,
+                "delta_disbelief": delta_d,
+            }
         else:
-            b, d, u, a = dequantize_binomial(
-                *annotation.opinion, precision=precision,
-            )
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[annotation.header.precision_mode]
 
-        result["opinion"] = {
-            "belief": b, "disbelief": d,
-            "uncertainty": u, "baseRate": a,
-        }
+            if precision == 32:
+                b, d, u, a = annotation.opinion
+            else:
+                b, d, u, a = dequantize_binomial(
+                    *annotation.opinion, precision=precision,
+                )
+
+            result["opinion"] = {
+                "belief": b, "disbelief": d,
+                "uncertainty": u, "baseRate": a,
+            }
 
     result["reasoningBackend"] = "subjective_logic"
 
@@ -389,19 +403,24 @@ def full_benchmark(
         0: int(annotation.header.compliance_status),
     }
     if annotation.header.has_opinion and annotation.opinion is not None:
-        precision_map = {
-            PrecisionMode.BITS_8: 8,
-            PrecisionMode.BITS_16: 16,
-            PrecisionMode.BITS_32: 32,
-        }
-        precision = precision_map[annotation.header.precision_mode]
-        if precision == 32:
-            b, d, u, a = annotation.opinion
+        if annotation.header.precision_mode == PrecisionMode.DELTA_8:
+            # Delta mode: CBOR-LD baseline encodes the raw deltas
+            delta_b, delta_d = annotation.opinion
+            cbor_ann_dict[1] = {0: delta_b, 1: delta_d}
         else:
-            b, d, u, a = dequantize_binomial(
-                *annotation.opinion, precision=precision,
-            )
-        cbor_ann_dict[1] = {0: b, 1: d, 2: u, 3: a}
+            precision_map = {
+                PrecisionMode.BITS_8: 8,
+                PrecisionMode.BITS_16: 16,
+                PrecisionMode.BITS_32: 32,
+            }
+            precision = precision_map[annotation.header.precision_mode]
+            if precision == 32:
+                b, d, u, a = annotation.opinion
+            else:
+                b, d, u, a = dequantize_binomial(
+                    *annotation.opinion, precision=precision,
+                )
+            cbor_ann_dict[1] = {0: b, 1: d, 2: u, 3: a}
 
     header = annotation.header
     if isinstance(header, (Tier2Header, Tier3Header)):

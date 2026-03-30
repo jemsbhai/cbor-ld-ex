@@ -332,6 +332,20 @@ def build_annotation_configs() -> list:
         ),
     ))
 
+    # Tier 1 delta mode (§7.6) — 3-byte annotation (1 header + 2 delta)
+    configs.append((
+        "t1-delta-compliant",
+        Annotation(
+            header=Tier1Header(
+                compliance_status=ComplianceStatus.COMPLIANT,
+                delegation_flag=False,
+                has_opinion=True,
+                precision_mode=PrecisionMode.DELTA_8,
+            ),
+            opinion=(5, -3),  # representative small delta
+        ),
+    ))
+
     # ── Tier 2 configurations ────────────────────────────────────
 
     # Tier 2 base fields — cumulative fusion from 5 sources
@@ -394,6 +408,15 @@ def build_annotation_configs() -> list:
                 temporal=_make_temporal_block(),
                 triggers=[_make_trigger()],
             ),
+        ),
+    ))
+
+    # Tier 2 delta mode (§7.6)
+    configs.append((
+        "t2-delta-compliant",
+        Annotation(
+            header=_t2_header(ComplianceStatus.COMPLIANT, PrecisionMode.DELTA_8),
+            opinion=(5, -3),
         ),
     ))
 
@@ -516,6 +539,7 @@ def build_scenario_matrix() -> list:
                 PrecisionMode.BITS_8: 8,
                 PrecisionMode.BITS_16: 16,
                 PrecisionMode.BITS_32: 32,
+                PrecisionMode.DELTA_8: 8,  # delta uses 8-bit baseline
             }
             precision = precision_map[annotation.header.precision_mode]
 
