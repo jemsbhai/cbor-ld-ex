@@ -267,6 +267,124 @@ def quantize_multinomial(
     return (beliefs_q, u_q, base_rates_q)
 
 
+# -------------------------------------------------------------------------
+# Delta encoding — §7.6, precision_mode=11
+#
+# Wire format: exactly 2 bytes, zero overhead.
+#   [1 byte]  Δb̂ (signed int8, range −128 to +127)
+#   [1 byte]  Δd̂ (signed int8)
+#
+# NOT transmitted: Δâ (base rate unchanged), Δû (derived).
+# Receiver reconstructs: b̂_new = b̂_prev + Δb̂, d̂_new = d̂_prev + Δd̂,
+#                        û_new = (2ⁿ−1) − b̂_new − d̂_new, â = â_prev.
+# -------------------------------------------------------------------------
+
+def encode_delta_bytes(delta_b: int, delta_d: int) -> bytes:
+    """Encode delta opinion to 2 bytes: signed int8 Δb̂, Δd̂.
+
+    Args:
+        delta_b: Change in quantized belief, must be in [-128, 127].
+        delta_d: Change in quantized disbelief, must be in [-128, 127].
+
+    Returns:
+        Exactly 2 bytes (big-endian signed int8 pair).
+
+    Raises:
+        ValueError: If either delta is outside signed int8 range.
+    """
+    if delta_b < -128 or delta_b > 127:
+        raise ValueError(
+            f"delta_b={delta_b} outside signed int8 range [-128, 127]. "
+            f"Encoder MUST fall back to full opinion (\u00a77.6)."
+        )
+    if delta_d < -128 or delta_d > 127:
+        raise ValueError(
+            f"delta_d={delta_d} outside signed int8 range [-128, 127]. "
+            f"Encoder MUST fall back to full opinion (\u00a77.6)."
+        )
+    return struct.pack(">bb", delta_b, delta_d)
+
+
+def decode_delta_bytes(data: bytes) -> tuple[int, int]:
+    """Decode 2-byte delta opinion to signed (Δb̂, Δd̂).
+
+    Args:
+        data: Exactly 2 bytes.
+
+    Returns:
+        (delta_b, delta_d) as signed integers.
+    """
+    return struct.unpack(">bb", data)
+
+
+def compute_delta(
+    prev: tuple[int, int, int, int],
+    curr: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Compute delta between two quantized opinions.
+
+    Args:
+        prev: Previous opinion (b̂_prev, d̂_prev, û_prev, â_prev).
+        curr: Current opinion (b̂_curr, d̂_curr, û_curr, â_curr).
+
+    Returns:
+        (Δb̂, Δd̂) as signed integers.
+
+    Raises:
+        ValueError: If either delta overflows signed int8 (§7.6 fallback).
+    """
+    delta_b = curr[0] - prev[0]
+    delta_d = curr[1] - prev[1]
+
+    if delta_b < -128 or delta_b > 127 or delta_d < -128 or delta_d > 127:
+        raise ValueError(
+            f"Delta overflow: \u0394b\u0302={delta_b}, \u0394d\u0302={delta_d}. "
+            f"Range is [-128, 127]. Encoder MUST fall back to full opinion (\u00a77.6)."
+        )
+    return (delta_b, delta_d)
+
+
+def apply_delta(
+    prev: tuple[int, int, int, int],
+    delta_b: int,
+    delta_d: int,
+    precision: int = 8,
+) -> tuple[int, int, int, int]:
+    """Apply delta to previous opinion, reconstructing current opinion.
+
+    Receiver-side reconstruction per \u00a77.6:
+      b\u0302_new = b\u0302_prev + \u0394b\u0302
+      d\u0302_new = d\u0302_prev + \u0394d\u0302
+      \u00fb_new = (2\u207f\u22121) \u2212 b\u0302_new \u2212 d\u0302_new
+      \u00e2 = \u00e2_prev (unchanged)
+
+    Args:
+        prev: Previous opinion (b\u0302_prev, d\u0302_prev, \u00fb_prev, \u00e2_prev).
+        delta_b: Signed delta for belief.
+        delta_d: Signed delta for disbelief.
+        precision: Quantization precision (default 8).
+
+    Returns:
+        (b\u0302_new, d\u0302_new, \u00fb_new, \u00e2_prev) \u2014 reconstructed opinion.
+
+    Raises:
+        ValueError: If reconstructed opinion violates constraints.
+    """
+    mv = _max_val(precision)
+    b_new = prev[0] + delta_b
+    d_new = prev[1] + delta_d
+
+    if b_new < 0 or d_new < 0 or b_new + d_new > mv:
+        raise ValueError(
+            f"Invalid reconstructed opinion: b\u0302={b_new}, d\u0302={d_new}. "
+            f"Constraint: b\u0302,d\u0302 \u2265 0 and b\u0302+d\u0302 \u2264 {mv}. "
+            f"Receiver MUST request full opinion retransmission."
+        )
+
+    u_new = mv - b_new - d_new
+    return (b_new, d_new, u_new, prev[3])
+
+
 def dequantize_multinomial(
     beliefs_q: list[int], u_q: int, base_rates_q: list[int], precision: int = 8
 ) -> tuple[list[float], float, list[float]]:

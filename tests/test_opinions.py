@@ -28,6 +28,10 @@ from cbor_ld_ex.opinions import (
     decode_opinion_bytes,
     encode_multinomial_bytes,
     decode_multinomial_bytes,
+    encode_delta_bytes,
+    decode_delta_bytes,
+    compute_delta,
+    apply_delta,
 )
 
 
@@ -1041,3 +1045,158 @@ class TestMultinomialWireEncoding:
         expected = _expected_multinomial_wire_bytes(k, precision)
         assert len(wire) == expected, \
             f"k={k}, {precision}-bit: wire {len(wire)}B != expected {expected}B"
+
+
+# ---------------------------------------------------------------------------
+# 11. Delta mode — precision_mode=11, 2-byte signed payload (§7.6)
+# ---------------------------------------------------------------------------
+
+class TestDeltaWireFormat:
+    """Delta encoding: 2 bytes (Δb̂, Δd̂) as signed int8. Zero overhead."""
+
+    def test_encode_delta_size_exactly_2_bytes(self):
+        """Delta payload is exactly 2 bytes — no framing, no padding."""
+        data = encode_delta_bytes(10, -5)
+        assert len(data) == 2
+
+    def test_encode_delta_zero(self):
+        """Zero deltas: both bytes are 0x00."""
+        data = encode_delta_bytes(0, 0)
+        assert data == bytes([0x00, 0x00])
+
+    def test_encode_delta_positive(self):
+        """Positive deltas: +10, +20."""
+        data = encode_delta_bytes(10, 20)
+        assert data == bytes([10, 20])
+
+    def test_encode_delta_negative(self):
+        """Negative deltas encoded as signed int8 (two's complement).
+
+        -1 = 0xFF, -128 = 0x80.
+        """
+        data = encode_delta_bytes(-1, -128)
+        assert data == bytes([0xFF, 0x80])
+
+    def test_encode_delta_max_range(self):
+        """Maximum range: +127, -128."""
+        data = encode_delta_bytes(127, -128)
+        assert data == bytes([127, 0x80])
+
+    def test_decode_delta_roundtrip(self):
+        """Encode → decode recovers exact signed values."""
+        for delta_b, delta_d in [(0, 0), (10, -5), (127, -128), (-1, 1), (-50, 50)]:
+            data = encode_delta_bytes(delta_b, delta_d)
+            rb, rd = decode_delta_bytes(data)
+            assert rb == delta_b, f"delta_b: {rb} != {delta_b}"
+            assert rd == delta_d, f"delta_d: {rd} != {delta_d}"
+
+    def test_encode_delta_rejects_overflow(self):
+        """Deltas outside [-128, 127] must be rejected (§7.6 fallback)."""
+        with pytest.raises(ValueError):
+            encode_delta_bytes(128, 0)
+        with pytest.raises(ValueError):
+            encode_delta_bytes(0, -129)
+
+    @given(
+        delta_b=st.integers(min_value=-128, max_value=127),
+        delta_d=st.integers(min_value=-128, max_value=127),
+    )
+    @settings(max_examples=500)
+    def test_roundtrip_property(self, delta_b, delta_d):
+        """Property: any valid (delta_b, delta_d) round-trips exactly."""
+        data = encode_delta_bytes(delta_b, delta_d)
+        assert len(data) == 2
+        rb, rd = decode_delta_bytes(data)
+        assert rb == delta_b
+        assert rd == delta_d
+
+
+class TestComputeAndApplyDelta:
+    """compute_delta + apply_delta: stateful delta encoding helpers."""
+
+    def test_compute_delta_no_change(self):
+        """Identical opinions produce zero deltas."""
+        prev = (200, 30, 25, 128)
+        curr = (200, 30, 25, 128)
+        delta_b, delta_d = compute_delta(prev, curr)
+        assert delta_b == 0
+        assert delta_d == 0
+
+    def test_compute_delta_small_change(self):
+        """Small changes produce small deltas."""
+        prev = (200, 30, 25, 128)
+        curr = (205, 28, 22, 128)  # b̂+5, d̂-2
+        delta_b, delta_d = compute_delta(prev, curr)
+        assert delta_b == 5
+        assert delta_d == -2
+
+    def test_compute_delta_overflow_raises(self):
+        """Deltas exceeding signed int8 range must raise (§7.6 fallback)."""
+        prev = (220, 10, 25, 128)
+        curr = (50, 180, 25, 128)  # Δb̂ = -170, overflows int8
+        with pytest.raises(ValueError, match="[Oo]verflow|[Rr]ange|[Ff]allback"):
+            compute_delta(prev, curr)
+
+    def test_apply_delta_reconstructs(self):
+        """apply_delta recovers the current opinion from prev + deltas."""
+        prev = (200, 30, 25, 128)
+        curr = (205, 28, 22, 128)
+        delta_b, delta_d = compute_delta(prev, curr)
+        reconstructed = apply_delta(prev, delta_b, delta_d)
+        # b̂_new, d̂_new, û_new, â_prev
+        assert reconstructed == (205, 28, 22, 128)
+
+    def test_apply_delta_derives_u(self):
+        """û is derived: 255 - b̂_new - d̂_new. Never transmitted."""
+        prev = (100, 100, 55, 128)
+        reconstructed = apply_delta(prev, 10, -10)
+        b, d, u, a = reconstructed
+        assert b == 110
+        assert d == 90
+        assert u == 255 - 110 - 90  # = 55
+        assert a == 128  # unchanged
+
+    def test_apply_delta_preserves_base_rate(self):
+        """Base rate â comes from previous opinion, NOT from wire."""
+        prev = (200, 30, 25, 77)
+        reconstructed = apply_delta(prev, -10, 5)
+        assert reconstructed[3] == 77
+
+    def test_apply_delta_rejects_invalid_result(self):
+        """Receiver MUST reject deltas producing invalid opinions (§7.6)."""
+        prev = (10, 10, 235, 128)
+        # Δb̂ = -20 would make b̂_new = -10 < 0
+        with pytest.raises(ValueError, match="[Ii]nvalid|[Cc]onstraint|[Nn]egative"):
+            apply_delta(prev, -20, 0)
+
+    def test_compute_apply_roundtrip(self):
+        """compute_delta → encode → decode → apply_delta recovers opinion."""
+        prev = (180, 40, 35, 100)
+        curr = (175, 45, 35, 100)
+        delta_b, delta_d = compute_delta(prev, curr)
+        wire = encode_delta_bytes(delta_b, delta_d)
+        rb, rd = decode_delta_bytes(wire)
+        result = apply_delta(prev, rb, rd)
+        assert result == curr
+
+    @given(
+        b_prev=st.integers(min_value=0, max_value=255),
+        d_prev=st.integers(min_value=0, max_value=255),
+        a_q=st.integers(min_value=0, max_value=255),
+        delta_b=st.integers(min_value=-128, max_value=127),
+        delta_d=st.integers(min_value=-128, max_value=127),
+    )
+    @settings(max_examples=1000)
+    def test_apply_delta_axiom3_property(self, b_prev, d_prev, a_q, delta_b, delta_d):
+        """Property: if apply_delta succeeds, b̂+d̂+û = 255."""
+        assume(b_prev + d_prev <= 255)
+        u_prev = 255 - b_prev - d_prev
+        prev = (b_prev, d_prev, u_prev, a_q)
+
+        b_new = b_prev + delta_b
+        d_new = d_prev + delta_d
+        # Skip invalid results
+        assume(b_new >= 0 and d_new >= 0 and b_new + d_new <= 255)
+
+        result = apply_delta(prev, delta_b, delta_d)
+        assert result[0] + result[1] + result[2] == 255
