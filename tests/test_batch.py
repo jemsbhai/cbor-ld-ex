@@ -26,6 +26,9 @@ from cbor_ld_ex.batch import (
     fwht,
     fwht_inverse,
     simplex_project,
+    lloyd_max_codebook,
+    quantize_lloyd_max,
+    dequantize_lloyd_max,
 )
 
 
@@ -684,3 +687,390 @@ class TestSimplexProjectProperties:
 
             assert dist_proj <= dist_noisy + 1e-10, \
                 f"Projection amplified error: {dist_proj} > {dist_noisy}"
+
+
+# =========================================================================
+# Lloyd-Max Optimal Scalar Quantizer — §4.8 Phase 4
+#
+# The Lloyd-Max algorithm iteratively optimizes a scalar quantizer for
+# a known distribution, minimizing MSE. For CBOR-LD-ex batch compression,
+# the target distribution is the post-RHT marginal:
+#   - Gaussian asymptotic mode (dim=None): N(0.5, 1/36), valid for D ≥ ~64
+#   - Beta-exact mode (dim=D): derived from uniform on S^(D-1)
+#
+# The codebook consists of:
+#   - boundaries: 2^b - 1 decision boundaries
+#   - centroids: 2^b reconstruction levels
+#
+# After convergence, the Lloyd-Max quantizer satisfies:
+#   1. Each boundary = midpoint of adjacent centroids (nearest-neighbor)
+#   2. Each centroid = conditional mean of distribution within its cell
+#
+# References:
+#   Lloyd, S.P. (1982). Least Squares Quantization in PCM.
+#   Max, J. (1960). Quantizing for Minimum Distortion.
+# =========================================================================
+
+
+class TestLloydMaxCodebook:
+    """Phase 4: Lloyd-Max optimal scalar quantizer for post-RHT distribution.
+
+    Tests cover both Gaussian asymptotic mode (dim=None) and Beta-exact
+    mode (dim=D), verifying shape, ordering, symmetry, optimality conditions,
+    and MSE superiority over uniform quantization.
+    """
+
+    # --- Shape and ordering ---
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5])
+    def test_codebook_shape_gaussian(self, bits):
+        """Gaussian mode: 2^b centroids and 2^b - 1 boundaries."""
+        boundaries, centroids = lloyd_max_codebook(bits)
+        assert len(centroids) == 2**bits
+        assert len(boundaries) == 2**bits - 1
+
+    @pytest.mark.parametrize("bits,dim", [(2, 32), (3, 64), (4, 128), (3, 256)])
+    def test_codebook_shape_beta(self, bits, dim):
+        """Beta-exact mode: 2^b centroids and 2^b - 1 boundaries."""
+        boundaries, centroids = lloyd_max_codebook(bits, dim=dim)
+        assert len(centroids) == 2**bits
+        assert len(boundaries) == 2**bits - 1
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5])
+    def test_boundaries_strictly_increasing(self, bits):
+        """Decision boundaries must be strictly increasing."""
+        boundaries, _ = lloyd_max_codebook(bits)
+        for i in range(len(boundaries) - 1):
+            assert boundaries[i] < boundaries[i + 1], \
+                f"bits={bits}: b[{i}]={boundaries[i]} >= b[{i+1}]={boundaries[i+1]}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5])
+    def test_centroids_strictly_increasing(self, bits):
+        """Reconstruction centroids must be strictly increasing."""
+        _, centroids = lloyd_max_codebook(bits)
+        for i in range(len(centroids) - 1):
+            assert centroids[i] < centroids[i + 1], \
+                f"bits={bits}: c[{i}]={centroids[i]} >= c[{i+1}]={centroids[i+1]}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_centroids_within_cells(self, bits):
+        """Each centroid lies strictly within its Voronoi cell."""
+        boundaries, centroids = lloyd_max_codebook(bits)
+        # First centroid < first boundary
+        assert centroids[0] < boundaries[0], \
+            f"c[0]={centroids[0]} >= b[0]={boundaries[0]}"
+        # Last centroid > last boundary
+        assert centroids[-1] > boundaries[-1], \
+            f"c[-1]={centroids[-1]} <= b[-1]={boundaries[-1]}"
+        # Interior centroids between adjacent boundaries
+        for i in range(len(boundaries) - 1):
+            assert boundaries[i] < centroids[i + 1] < boundaries[i + 1], \
+                f"c[{i+1}]={centroids[i+1]} not in ({boundaries[i]}, {boundaries[i+1]})"
+
+    # --- Symmetry ---
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_symmetry_gaussian(self, bits):
+        """Gaussian N(0.5, 1/36) is symmetric about 0.5.
+
+        Therefore: b[i] + b[K-2-i] = 1.0 and c[i] + c[K-1-i] = 1.0
+        where K = 2^bits.
+        """
+        boundaries, centroids = lloyd_max_codebook(bits)
+        n_b = len(boundaries)
+        n_c = len(centroids)
+        for i in range(n_b):
+            assert abs(boundaries[i] + boundaries[n_b - 1 - i] - 1.0) < 1e-6, \
+                f"bits={bits}: b[{i}]+b[{n_b-1-i}] = {boundaries[i]+boundaries[n_b-1-i]}"
+        for i in range(n_c):
+            assert abs(centroids[i] + centroids[n_c - 1 - i] - 1.0) < 1e-6, \
+                f"bits={bits}: c[{i}]+c[{n_c-1-i}] = {centroids[i]+centroids[n_c-1-i]}"
+
+    @pytest.mark.parametrize("bits,dim", [(2, 64), (3, 128)])
+    def test_symmetry_beta(self, bits, dim):
+        """Beta-exact mode: sphere marginal is symmetric about 0.5.
+
+        The marginal of a uniform point on S^(D-1), after the affine
+        mapping x = t/C + 0.5, is symmetric about 0.5.
+        """
+        boundaries, centroids = lloyd_max_codebook(bits, dim=dim)
+        n_b = len(boundaries)
+        n_c = len(centroids)
+        for i in range(n_b):
+            assert abs(boundaries[i] + boundaries[n_b - 1 - i] - 1.0) < 1e-5, \
+                f"dim={dim}, bits={bits}: b[{i}]+b[{n_b-1-i}] != 1.0"
+        for i in range(n_c):
+            assert abs(centroids[i] + centroids[n_c - 1 - i] - 1.0) < 1e-5, \
+                f"dim={dim}, bits={bits}: c[{i}]+c[{n_c-1-i}] != 1.0"
+
+    # --- Optimality conditions ---
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5])
+    def test_nearest_neighbor_boundaries(self, bits):
+        """After convergence, each boundary = midpoint of adjacent centroids.
+
+        This is the nearest-neighbor (Voronoi) condition: the boundary
+        between cells i and i+1 is where distances to c_i and c_{i+1}
+        are equal, i.e. the midpoint in 1D.
+        """
+        boundaries, centroids = lloyd_max_codebook(bits)
+        for i in range(len(boundaries)):
+            midpoint = (centroids[i] + centroids[i + 1]) / 2
+            assert abs(boundaries[i] - midpoint) < 1e-6, \
+                f"bits={bits}, i={i}: boundary={boundaries[i]}, midpoint={midpoint}"
+
+    def test_centroid_conditional_mean_gaussian(self):
+        """Each centroid = E[X | cell] under N(0.5, 1/36).
+
+        Independent verification using scipy to compute the truncated
+        normal conditional expectation analytically. This is the
+        centroid optimality condition (non-circular: scipy computes
+        the integral, our implementation runs Lloyd-Max iterations).
+        """
+        scipy_stats = pytest.importorskip("scipy.stats")
+        from scipy.integrate import quad
+
+        mu, sigma = 0.5, 1.0 / 6.0
+        dist = scipy_stats.truncnorm(
+            (0.0 - mu) / sigma, (1.0 - mu) / sigma, loc=mu, scale=sigma
+        )
+
+        for bits in [2, 3, 4]:
+            boundaries, centroids = lloyd_max_codebook(bits)
+            edges = [0.0] + list(boundaries) + [1.0]
+
+            for i in range(len(centroids)):
+                a, b = edges[i], edges[i + 1]
+                p_cell = dist.cdf(b) - dist.cdf(a)
+                if p_cell < 1e-15:
+                    continue  # Skip negligible-probability cells
+                integrand = lambda x: x * dist.pdf(x)
+                expected_val, _ = quad(integrand, a, b)
+                expected_val /= p_cell
+
+                assert abs(centroids[i] - expected_val) < 1e-5, \
+                    f"bits={bits}, cell {i}: centroid={centroids[i]}, " \
+                    f"E[X|cell]={expected_val}"
+
+    # --- MSE quality ---
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_lloyd_max_beats_uniform_gaussian(self, bits):
+        """Lloyd-Max MSE ≤ uniform MSE under N(0.5, 1/36) samples.
+
+        This is THE key property: the optimized codebook must do at
+        least as well as naive uniform quantization for the actual
+        distribution encountered after the RHT.
+        """
+        import random
+        random.seed(42)
+
+        n_samples = 50000
+        sigma = 1.0 / 6.0
+        samples = [
+            max(0.0, min(1.0, random.gauss(0.5, sigma)))
+            for _ in range(n_samples)
+        ]
+
+        # Lloyd-Max MSE
+        boundaries, centroids = lloyd_max_codebook(bits)
+        mse_lm = 0.0
+        for x in samples:
+            code = quantize_lloyd_max(x, boundaries)
+            recon = dequantize_lloyd_max(code, centroids)
+            mse_lm += (x - recon) ** 2
+        mse_lm /= n_samples
+
+        # Uniform MSE
+        levels = 2**bits - 1
+        mse_uniform = 0.0
+        for x in samples:
+            code_u = max(0, min(levels, round(x * levels)))
+            recon_u = code_u / levels
+            mse_uniform += (x - recon_u) ** 2
+        mse_uniform /= n_samples
+
+        assert mse_lm <= mse_uniform * (1 + 1e-6), \
+            f"bits={bits}: Lloyd-Max MSE {mse_lm:.6e} > uniform MSE {mse_uniform:.6e}"
+
+    @pytest.mark.parametrize("bits", [2, 3])
+    def test_lloyd_max_beats_uniform_beta(self, bits):
+        """Lloyd-Max MSE ≤ uniform MSE under Beta-exact distribution.
+
+        Samples drawn from the sphere marginal (Gaussian vectors
+        normalized to unit sphere), mapped to [0,1] via x = t/C + 0.5.
+        """
+        import random
+        random.seed(42)
+
+        dim = 128
+        n_samples = 20000
+        c_val = 6.0 / math.sqrt(dim)
+
+        samples = []
+        for _ in range(n_samples):
+            v = [random.gauss(0, 1) for _ in range(dim)]
+            norm = math.sqrt(sum(xi**2 for xi in v))
+            t = v[0] / norm  # marginal of uniform on S^(D-1)
+            x = t / c_val + 0.5
+            x = max(0.0, min(1.0, x))
+            samples.append(x)
+
+        # Lloyd-Max (Beta-exact)
+        boundaries, centroids = lloyd_max_codebook(bits, dim=dim)
+        mse_lm = sum(
+            (x - dequantize_lloyd_max(
+                quantize_lloyd_max(x, boundaries), centroids
+            )) ** 2
+            for x in samples
+        ) / n_samples
+
+        # Uniform
+        levels = 2**bits - 1
+        mse_u = sum(
+            (x - max(0, min(levels, round(x * levels))) / levels) ** 2
+            for x in samples
+        ) / n_samples
+
+        assert mse_lm <= mse_u * (1 + 1e-6), \
+            f"dim={dim}, bits={bits}: Lloyd-Max MSE {mse_lm:.6e} > uniform {mse_u:.6e}"
+
+    def test_mse_decreases_with_bits(self):
+        """More bits → strictly lower MSE (monotonicity sanity check)."""
+        import random
+        random.seed(42)
+
+        n_samples = 20000
+        sigma = 1.0 / 6.0
+        samples = [
+            max(0.0, min(1.0, random.gauss(0.5, sigma)))
+            for _ in range(n_samples)
+        ]
+
+        prev_mse = float('inf')
+        for bits in [2, 3, 4, 5]:
+            boundaries, centroids = lloyd_max_codebook(bits)
+            mse = sum(
+                (x - dequantize_lloyd_max(
+                    quantize_lloyd_max(x, boundaries), centroids
+                )) ** 2
+                for x in samples
+            ) / n_samples
+            assert mse < prev_mse, \
+                f"bits={bits}: MSE {mse:.6e} >= previous {prev_mse:.6e}"
+            prev_mse = mse
+
+    # --- Convergence between modes ---
+
+    def test_gaussian_and_beta_converge_large_d(self):
+        """For large D, Beta-exact codebook ≈ Gaussian codebook.
+
+        Concentration of measure: the sphere marginal → N(0, 1/D) as
+        D → ∞, so after the affine mapping both distributions converge
+        to N(0.5, 1/36). The codebooks should therefore converge.
+        """
+        bits = 3
+        b_gauss, c_gauss = lloyd_max_codebook(bits)
+
+        for dim in [256, 512]:
+            b_beta, c_beta = lloyd_max_codebook(bits, dim=dim)
+
+            for i in range(len(b_gauss)):
+                assert abs(b_gauss[i] - b_beta[i]) < 0.01, \
+                    f"dim={dim}: Gaussian b[{i}]={b_gauss[i]:.6f}, " \
+                    f"Beta b[{i}]={b_beta[i]:.6f}"
+
+            for i in range(len(c_gauss)):
+                assert abs(c_gauss[i] - c_beta[i]) < 0.01, \
+                    f"dim={dim}: Gaussian c[{i}]={c_gauss[i]:.6f}, " \
+                    f"Beta c[{i}]={c_beta[i]:.6f}"
+
+    # --- Cache ---
+
+    def test_cache_returns_identical(self):
+        """Same parameters return the exact same codebook objects."""
+        b1, c1 = lloyd_max_codebook(3)
+        b2, c2 = lloyd_max_codebook(3)
+        assert b1 is b2, "Cache should return the same list object"
+        assert c1 is c2, "Cache should return the same list object"
+
+    def test_cache_distinct_for_different_params(self):
+        """Different parameters return different codebooks."""
+        b3, _ = lloyd_max_codebook(3)
+        b4, _ = lloyd_max_codebook(4)
+        assert b3 is not b4
+
+        # Beta vs Gaussian at same bits
+        b_gauss, _ = lloyd_max_codebook(3)
+        b_beta, _ = lloyd_max_codebook(3, dim=32)
+        assert b_gauss is not b_beta
+
+
+class TestLloydMaxQuantize:
+    """Phase 4: quantize and dequantize using Lloyd-Max codebook."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_centroids_quantize_to_own_code(self, bits):
+        """Each centroid maps to its own index."""
+        boundaries, centroids = lloyd_max_codebook(bits)
+        for i, c in enumerate(centroids):
+            code = quantize_lloyd_max(c, boundaries)
+            assert code == i, \
+                f"bits={bits}: centroid[{i}]={c} mapped to code {code}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_codes_in_valid_range(self, bits):
+        """All codes are in [0, 2^b - 1]."""
+        import random
+        random.seed(42)
+        boundaries, _ = lloyd_max_codebook(bits)
+        max_code = 2**bits - 1
+        for _ in range(1000):
+            x = random.random()
+            code = quantize_lloyd_max(x, boundaries)
+            assert 0 <= code <= max_code, \
+                f"bits={bits}: code {code} out of range [0, {max_code}]"
+
+    def test_quantize_monotonic(self):
+        """Monotonicity: x1 < x2 implies quantize(x1) ≤ quantize(x2)."""
+        boundaries, _ = lloyd_max_codebook(3)
+        xs = [i / 1000.0 for i in range(1001)]
+        codes = [quantize_lloyd_max(x, boundaries) for x in xs]
+        for i in range(len(codes) - 1):
+            assert codes[i] <= codes[i + 1], \
+                f"x={xs[i]:.3f}→{codes[i]}, x={xs[i+1]:.3f}→{codes[i+1]}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_dequantize_returns_centroid(self, bits):
+        """Dequantize maps each code to the corresponding centroid."""
+        _, centroids = lloyd_max_codebook(bits)
+        for i in range(2**bits):
+            val = dequantize_lloyd_max(i, centroids)
+            assert val == centroids[i], \
+                f"bits={bits}: dequantize({i}) = {val}, expected {centroids[i]}"
+
+    def test_extreme_values(self):
+        """Values well outside [0,1] map to extreme codes.
+
+        Since all boundaries are within (0, 1), a value below all
+        boundaries gets code 0, and above all boundaries gets the
+        maximum code. No explicit clamping needed — follows from
+        the comparison logic.
+        """
+        boundaries, _ = lloyd_max_codebook(3)
+        max_code = 2**3 - 1
+        assert quantize_lloyd_max(-0.5, boundaries) == 0
+        assert quantize_lloyd_max(1.5, boundaries) == max_code
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_roundtrip_near_centroids(self, bits):
+        """Values near centroids survive roundtrip with minimal error."""
+        boundaries, centroids = lloyd_max_codebook(bits)
+        for i, c in enumerate(centroids):
+            # Slightly perturb centroid
+            for delta in [-1e-8, 0.0, 1e-8]:
+                x = c + delta
+                code = quantize_lloyd_max(x, boundaries)
+                recon = dequantize_lloyd_max(code, centroids)
+                assert abs(recon - c) < 1e-6, \
+                    f"bits={bits}, centroid {i}: x={x}, recon={recon}"

@@ -196,6 +196,7 @@ class Xoshiro128PlusPlus:
 # then scales by 1/√D. For D=256 (N=50 sensors): 2048 add/sub + 256 mul.
 # =========================================================================
 
+import bisect as _bisect
 import math as _math
 
 
@@ -336,3 +337,198 @@ def simplex_project(x: list[float]) -> list[float]:
 
     # Step 3: Shift and clamp
     return [max(0.0, xi - theta) for xi in x]
+
+
+# =========================================================================
+# Lloyd-Max Optimal Scalar Quantizer — §4.8 Phase 4
+#
+# The Lloyd-Max algorithm iteratively minimizes MSE for a known
+# distribution by alternating two steps:
+#   1. Nearest-neighbor: each boundary = midpoint of adjacent centroids
+#   2. Centroid: each centroid = conditional mean within its cell
+#
+# Two distribution modes:
+#   - Gaussian asymptotic (dim=None): N(0.5, 1/36) truncated to [0,1]
+#     Valid for D ≥ ~64 by concentration of measure.
+#   - Beta-exact (dim=D): exact sphere marginal after affine mapping.
+#     Accurate for all D, required when D < ~64.
+#
+# Both distributions are symmetric about 0.5 (the sphere marginal
+# is symmetric because Beta(α,α) is symmetric). This symmetry is
+# preserved in the converged codebook.
+#
+# Codebook is tiny: 2^b centroids + 2^b-1 boundaries per configuration.
+# For 3-bit: 15 floats = 60 bytes. Computed once, cached.
+#
+# References:
+#   Lloyd, S.P. (1982). Least Squares Quantization in PCM.
+#   Max, J. (1960). Quantizing for Minimum Distortion.
+# =========================================================================
+
+# Cache: (bits, dim) -> (boundaries, centroids)
+_codebook_cache: dict[tuple[int, int | None], tuple[list[float], list[float]]] = {}
+
+
+def lloyd_max_codebook(
+    bits: int,
+    dim: int | None = None,
+    iterations: int = 300,
+) -> tuple[list[float], list[float]]:
+    """Compute Lloyd-Max optimal scalar quantizer for post-RHT distribution.
+
+    Two modes:
+      - Gaussian asymptotic (dim=None): N(0.5, 1/36) truncated to [0,1].
+        Accurate for D ≥ ~64 where concentration of measure makes the
+        sphere marginal approximately Gaussian.
+      - Beta-exact (dim=D): exact marginal distribution of a single
+        coordinate of a uniform point on S^(D-1), mapped to [0,1] via
+        the protocol's affine transform x = t/C + 0.5, C = 6/√D.
+
+    The codebook is cached: repeated calls with the same (bits, dim)
+    return the same objects without recomputation.
+
+    Args:
+        bits: Number of quantization bits (2–8).
+        dim: Padded dimension D for Beta-exact mode, or None for Gaussian.
+        iterations: Maximum Lloyd-Max iterations (default 300).
+
+    Returns:
+        (boundaries, centroids): boundaries is a list of 2^b − 1
+        decision boundaries (sorted ascending), centroids is a list
+        of 2^b reconstruction levels (sorted ascending).
+
+    Raises:
+        ImportError: If scipy is not available.
+    """
+    cache_key = (bits, dim)
+    if cache_key in _codebook_cache:
+        return _codebook_cache[cache_key]
+
+    # Lazy import — scipy is a compute dependency, not a deploy dependency.
+    # On constrained devices, ship pre-computed codebooks.
+    try:
+        from scipy.stats import truncnorm as _truncnorm
+        from scipy.stats import beta as _beta_dist
+        from scipy.integrate import quad as _quad
+    except ImportError:
+        raise ImportError(
+            "scipy is required for Lloyd-Max codebook computation. "
+            "Install it with: pip install scipy"
+        )
+
+    k = 2 ** bits  # number of reconstruction levels
+
+    # ---- Build target distribution (PDF and CDF on [0, 1]) ----
+
+    if dim is None:
+        # Gaussian asymptotic: N(0.5, 1/36) truncated to [0, 1]
+        mu, sigma = 0.5, 1.0 / 6.0
+        a_clip = (0.0 - mu) / sigma   # = -3.0
+        b_clip = (1.0 - mu) / sigma   # = +3.0
+        dist = _truncnorm(a_clip, b_clip, loc=mu, scale=sigma)
+        pdf = dist.pdf
+        cdf = dist.cdf
+    else:
+        # Beta-exact: sphere marginal mapped to [0, 1]
+        #
+        # A single coordinate t of a uniform point on S^(D-1) has
+        # PDF ∝ (1 − t²)^((D−3)/2) on [−1, 1].
+        # Equivalently, u = (t+1)/2 ~ Beta(α, α) with α = (D−1)/2.
+        #
+        # After the protocol's affine mapping x = t/C + 0.5:
+        #   u(x) = C·(x − 0.5)/2 + 0.5
+        #   du/dx = C/2
+        #   f_X(x) = f_U(u(x)) · (C/2) / P(X ∈ [0,1])
+        #
+        # We use scipy's Beta CDF directly (no numerical integration
+        # for CDF), and numerical integration only for conditional means.
+        c_val = 6.0 / _math.sqrt(float(dim))
+        alpha_param = (dim - 1) / 2.0
+        beta_rv = _beta_dist(alpha_param, alpha_param)
+
+        def _x_to_u(x: float) -> float:
+            """Map x ∈ [0,1] to u ∈ [0,1] (Beta variable)."""
+            return max(0.0, min(1.0, c_val * (x - 0.5) / 2.0 + 0.5))
+
+        u_lo = _x_to_u(0.0)
+        u_hi = _x_to_u(1.0)
+        p_total = beta_rv.cdf(u_hi) - beta_rv.cdf(u_lo)
+
+        def cdf(x: float) -> float:
+            if x <= 0.0:
+                return 0.0
+            if x >= 1.0:
+                return 1.0
+            u = _x_to_u(x)
+            return (beta_rv.cdf(u) - beta_rv.cdf(u_lo)) / p_total
+
+        def pdf(x: float) -> float:
+            u = c_val * (x - 0.5) / 2.0 + 0.5
+            if u <= 0.0 or u >= 1.0:
+                return 0.0
+            return beta_rv.pdf(u) * (c_val / 2.0) / p_total
+
+    # ---- Lloyd-Max iteration ----
+
+    # Initialize centroids uniformly in [0, 1]
+    centroids = [(i + 0.5) / k for i in range(k)]
+
+    for _ in range(iterations):
+        # Step 1: Boundaries = midpoints of adjacent centroids
+        boundaries = [
+            (centroids[i] + centroids[i + 1]) / 2.0
+            for i in range(k - 1)
+        ]
+
+        # Step 2: Centroids = conditional means within cells
+        edges = [0.0] + boundaries + [1.0]
+        new_centroids = []
+        for i in range(k):
+            lo, hi = edges[i], edges[i + 1]
+            p_cell = cdf(hi) - cdf(lo)
+            if p_cell < 1e-15:
+                # Negligible probability — keep old centroid
+                new_centroids.append(centroids[i])
+                continue
+            # E[X | lo ≤ X ≤ hi] = ∫ x·f(x) dx / P(cell)
+            numerator, _ = _quad(lambda x: x * pdf(x), lo, hi)
+            new_centroids.append(numerator / p_cell)
+
+        centroids = new_centroids
+
+    # Final boundaries from converged centroids
+    boundaries = [
+        (centroids[i] + centroids[i + 1]) / 2.0
+        for i in range(k - 1)
+    ]
+
+    _codebook_cache[cache_key] = (boundaries, centroids)
+    return boundaries, centroids
+
+
+def quantize_lloyd_max(x: float, boundaries: list[float]) -> int:
+    """Quantize a scalar value using Lloyd-Max decision boundaries.
+
+    Uses binary search for O(log K) lookup.
+
+    Args:
+        x: Value to quantize.
+        boundaries: Sorted decision boundaries (length K−1).
+
+    Returns:
+        Code index in [0, K−1] where K = len(boundaries) + 1.
+    """
+    return _bisect.bisect_right(boundaries, x)
+
+
+def dequantize_lloyd_max(code: int, centroids: list[float]) -> float:
+    """Reconstruct a value from its Lloyd-Max quantization code.
+
+    Args:
+        code: Quantization code in [0, K−1].
+        centroids: Reconstruction levels (length K).
+
+    Returns:
+        Centroid value for the given code.
+    """
+    return centroids[code]
