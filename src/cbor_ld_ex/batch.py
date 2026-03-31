@@ -532,3 +532,159 @@ def dequantize_lloyd_max(code: int, centroids: list[float]) -> float:
         Centroid value for the given code.
     """
     return centroids[code]
+
+
+# =========================================================================
+# Randomized Hadamard Transform (RHT) — §4.8.3 (Definition 34)
+#
+# The RHT combines three operations:
+#   1. Random permutation P (Fisher-Yates from PRNG)
+#   2. Random sign flips σ ∈ {−1, +1}^D (from PRNG)
+#   3. Normalized Walsh-Hadamard transform H_D
+#
+# Forward:  w = H_D · (σ ⊙ P(v))
+# Inverse:  v = P⁻¹(σ ⊙ H_D · w)
+#
+# Bit consumption order from xoshiro128++ (Definition 34d):
+#   First D bits for σ (MSB-first from each next() call),
+#   then Fisher-Yates shuffle bits for P.
+#
+# Both encoder and decoder MUST generate identical σ and P from
+# the same seed. This is protocol-critical.
+# =========================================================================
+
+
+def _generate_signs(rng: Xoshiro128PlusPlus, d: int) -> list[int]:
+    """Generate a random sign vector from the PRNG.
+
+    Consumes D bits from the PRNG, MSB-first from each next() call.
+    Each sign is +1 or -1.
+
+    Args:
+        rng: Initialized xoshiro128++ PRNG.
+        d: Dimension (number of signs to generate).
+
+    Returns:
+        List of D values, each +1 or -1.
+    """
+    signs = []
+    bits_remaining = 0
+    current_word = 0
+
+    for _ in range(d):
+        if bits_remaining == 0:
+            current_word = rng.next()
+            bits_remaining = 32
+        # Extract MSB of remaining bits
+        bit = (current_word >> (bits_remaining - 1)) & 1
+        bits_remaining -= 1
+        signs.append(2 * bit - 1)  # 0 → -1, 1 → +1
+
+    return signs
+
+
+def _generate_permutation(rng: Xoshiro128PlusPlus, d: int) -> list[int]:
+    """Generate a random permutation via Fisher-Yates shuffle.
+
+    For i from D-1 down to 1, pick j uniform in [0, i] using
+    rejection sampling from next_bits(⌈log₂(i+1)⌉).
+
+    Args:
+        rng: Initialized xoshiro128++ PRNG (state continues from
+             after sign generation).
+        d: Dimension.
+
+    Returns:
+        Permutation as a list: perm[k] = index to read from.
+    """
+    perm = list(range(d))
+
+    for i in range(d - 1, 0, -1):
+        # Number of bits needed: ceil(log2(i+1))
+        n_bits = (i + 1).bit_length()
+        # Rejection sampling: draw until value <= i
+        while True:
+            j = rng.next_bits(n_bits)
+            if j <= i:
+                break
+        perm[i], perm[j] = perm[j], perm[i]
+
+    return perm
+
+
+def _invert_permutation(perm: list[int]) -> list[int]:
+    """Compute the inverse of a permutation.
+
+    If perm maps position k to perm[k], the inverse maps
+    perm[k] back to k.
+    """
+    inv = [0] * len(perm)
+    for k, v in enumerate(perm):
+        inv[v] = k
+    return inv
+
+
+def rht_forward(v: list[float], seed: int) -> list[float]:
+    """Apply the Randomized Hadamard Transform (Definition 34).
+
+    Computes w = H_D · (σ ⊙ P(v)) where:
+      - P is a random permutation from xoshiro128++(seed)
+      - σ is a random sign vector from xoshiro128++(seed)
+      - H_D is the normalized Walsh-Hadamard matrix
+
+    Bit consumption from PRNG: D bits for σ, then Fisher-Yates
+    bits for P, all from the same seeded PRNG sequence.
+
+    Args:
+        v: Input vector of length D (must be a power of 2).
+        seed: uint32 PRNG seed.
+
+    Returns:
+        Rotated vector w of length D.
+    """
+    d = len(v)
+    rng = Xoshiro128PlusPlus(seed)
+
+    # Consume bits in protocol order: signs first, then permutation
+    signs = _generate_signs(rng, d)
+    perm = _generate_permutation(rng, d)
+
+    # Apply permutation: permuted[k] = v[perm[k]]
+    permuted = [v[perm[k]] for k in range(d)]
+
+    # Apply sign flips: signed[k] = signs[k] * permuted[k]
+    signed = [signs[k] * permuted[k] for k in range(d)]
+
+    # Apply normalized FWHT
+    return fwht(signed)
+
+
+def rht_inverse(w: list[float], seed: int) -> list[float]:
+    """Apply the inverse Randomized Hadamard Transform.
+
+    Computes v = P⁻¹(σ ⊙ H_D · w) where σ, P are regenerated
+    from the same seed used in the forward transform.
+
+    Args:
+        w: Rotated vector of length D (must be a power of 2).
+        seed: uint32 PRNG seed (same as used in rht_forward).
+
+    Returns:
+        Recovered vector v of length D.
+    """
+    d = len(w)
+    rng = Xoshiro128PlusPlus(seed)
+
+    # Regenerate signs and permutation in the same order
+    signs = _generate_signs(rng, d)
+    perm = _generate_permutation(rng, d)
+    inv_perm = _invert_permutation(perm)
+
+    # Inverse FWHT (self-inverse)
+    h_w = fwht(w)
+
+    # Undo sign flips
+    unsigned = [signs[k] * h_w[k] for k in range(d)]
+
+    # Undo permutation: v[perm[k]] = unsigned[k], i.e. v[j] = unsigned[inv_perm[j]]
+    return [unsigned[inv_perm[k]] for k in range(d)]

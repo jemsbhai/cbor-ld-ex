@@ -29,6 +29,8 @@ from cbor_ld_ex.batch import (
     lloyd_max_codebook,
     quantize_lloyd_max,
     dequantize_lloyd_max,
+    rht_forward,
+    rht_inverse,
 )
 
 
@@ -1074,3 +1076,248 @@ class TestLloydMaxQuantize:
                 recon = dequantize_lloyd_max(code, centroids)
                 assert abs(recon - c) < 1e-6, \
                     f"bits={bits}, centroid {i}: x={x}, recon={recon}"
+
+
+# =========================================================================
+# Randomized Hadamard Transform (RHT) — §4.8 Phase 5a
+#
+# Definition 34: The RHT applies a random sign flip, random permutation,
+# and normalized Walsh-Hadamard transform. The inverse reverses all three.
+#
+# Protocol-critical: both encoder and decoder generate identical sign
+# vectors and permutations from the same xoshiro128++ seed. Bit
+# consumption order: first D bits for signs (MSB-first from each next()
+# call), then Fisher-Yates shuffle bits for the permutation.
+#
+# Properties:
+#   - Roundtrip: rht_inverse(rht_forward(v, seed), seed) = v
+#   - Orthogonal: ‖rht_forward(v, seed)‖ = ‖v‖ (norm preservation)
+#   - Deterministic: same seed → same output
+# =========================================================================
+
+
+class TestRHTRoundtrip:
+    """Phase 5a: rht_inverse(rht_forward(v, seed), seed) = v.
+
+    THE critical correctness property. If this fails, the batch
+    codec cannot recover the original opinions.
+    """
+
+    @pytest.mark.parametrize("d", [4, 8, 16, 32, 64, 128, 256])
+    def test_roundtrip_random_vector(self, d):
+        """Random vector survives forward → inverse at all power-of-2 sizes."""
+        import random
+        random.seed(42 + d)
+        v = [random.gauss(0, 1) for _ in range(d)]
+        seed = 12345
+
+        w = rht_forward(v, seed)
+        v_recovered = rht_inverse(w, seed)
+
+        assert len(v_recovered) == d
+        for i in range(d):
+            assert abs(v_recovered[i] - v[i]) < 1e-9, \
+                f"d={d}, i={i}: expected {v[i]:.10f}, got {v_recovered[i]:.10f}"
+
+    def test_roundtrip_opinion_like(self):
+        """Roundtrip with opinion-like data (values in [0,1], padded).
+
+        Simulates the actual batch pipeline: 10 opinions → 30 values →
+        pad to D=32 → RHT → inverse RHT → recover first 30.
+        """
+        import random
+        random.seed(99)
+
+        n_opinions = 10
+        # 3 free params per opinion: b, d, a
+        raw = []
+        for _ in range(n_opinions):
+            b = random.random() * 0.5
+            d = random.random() * (1.0 - b)
+            a = random.random()
+            raw.extend([b, d, a])
+
+        # Pad to power of 2
+        d = 32  # next power of 2 >= 30
+        v_padded = raw + [0.0] * (d - len(raw))
+
+        w = rht_forward(v_padded, seed=42)
+        v_recovered = rht_inverse(w, seed=42)
+
+        for i in range(len(raw)):
+            assert abs(v_recovered[i] - raw[i]) < 1e-9, \
+                f"i={i}: expected {raw[i]:.10f}, got {v_recovered[i]:.10f}"
+        # Padding should also recover
+        for i in range(len(raw), d):
+            assert abs(v_recovered[i]) < 1e-9
+
+    @pytest.mark.parametrize("seed", [0, 1, 42, 0xDEADBEEF, 0xFFFFFFFF])
+    def test_roundtrip_multiple_seeds(self, seed):
+        """Roundtrip works for various seeds."""
+        import random
+        random.seed(seed & 0xFFFF)
+        v = [random.gauss(0, 1) for _ in range(64)]
+
+        w = rht_forward(v, seed)
+        v_recovered = rht_inverse(w, seed)
+
+        for i in range(64):
+            assert abs(v_recovered[i] - v[i]) < 1e-9
+
+    def test_roundtrip_unit_vectors(self):
+        """Each standard basis vector survives roundtrip."""
+        d = 16
+        seed = 42
+        for k in range(d):
+            v = [0.0] * d
+            v[k] = 1.0
+            w = rht_forward(v, seed)
+            v_recovered = rht_inverse(w, seed)
+            for i in range(d):
+                assert abs(v_recovered[i] - v[i]) < 1e-9, \
+                    f"basis e_{k}, i={i}"
+
+
+class TestRHTOrthogonality:
+    """The RHT is orthogonal: ‖w‖ = ‖v‖ (norm preservation).
+
+    Critical for distortion-rate analysis: quantization MSE in the
+    rotated domain equals MSE in the original domain.
+    """
+
+    @pytest.mark.parametrize("d", [8, 16, 32, 64, 128, 256])
+    def test_norm_preservation(self, d):
+        """L2 norm is preserved after forward RHT."""
+        import random
+        random.seed(42 + d)
+        v = [random.gauss(0, 1) for _ in range(d)]
+
+        w = rht_forward(v, seed=42)
+
+        norm_v = math.sqrt(sum(x**2 for x in v))
+        norm_w = math.sqrt(sum(x**2 for x in w))
+
+        assert abs(norm_v - norm_w) < 1e-9 * norm_v, \
+            f"d={d}: ‖v‖={norm_v:.10f}, ‖w‖={norm_w:.10f}"
+
+    def test_norm_preservation_opinion_data(self):
+        """Norm preserved for opinion-like data (bounded [0,1] values)."""
+        import random
+        random.seed(99)
+        v = [random.random() for _ in range(64)]
+
+        w = rht_forward(v, seed=123)
+
+        norm_v = math.sqrt(sum(x**2 for x in v))
+        norm_w = math.sqrt(sum(x**2 for x in w))
+
+        assert abs(norm_v - norm_w) < 1e-9 * norm_v
+
+
+class TestRHTDeterminism:
+    """Protocol-mandated: same seed produces bit-identical output.
+
+    Any conformant implementation MUST produce the same sign vector
+    and permutation from the same seed (Definition 34d).
+    """
+
+    def test_same_seed_same_output(self):
+        """Two calls with same seed produce identical results."""
+        import random
+        random.seed(42)
+        v = [random.gauss(0, 1) for _ in range(64)]
+
+        w1 = rht_forward(v, seed=42)
+        w2 = rht_forward(v, seed=42)
+
+        for i in range(64):
+            assert w1[i] == w2[i], f"i={i}: {w1[i]} != {w2[i]}"
+
+    def test_different_seeds_differ(self):
+        """Different seeds produce different rotations."""
+        import random
+        random.seed(42)
+        v = [random.gauss(0, 1) for _ in range(16)]  # dense vector
+
+        w1 = rht_forward(v, seed=0)
+        w2 = rht_forward(v, seed=1)
+
+        # At least some coordinates must differ
+        diffs = sum(1 for a, b in zip(w1, w2) if abs(a - b) > 1e-12)
+        assert diffs > 0, "Different seeds produced identical output"
+
+    def test_different_seeds_produce_different_internals(self):
+        """Directly verify signs and permutations differ for different seeds.
+
+        This is a diagnostic test ensuring the PRNG generates distinct
+        internal state for different seeds. Addresses the concern that
+        seeds 0 and 1 might accidentally produce identical RHT parameters.
+        """
+        from cbor_ld_ex.batch import (
+            _generate_signs, _generate_permutation,
+        )
+        d = 16
+
+        rng0 = Xoshiro128PlusPlus(0)
+        signs0 = _generate_signs(rng0, d)
+        perm0 = _generate_permutation(rng0, d)
+
+        rng1 = Xoshiro128PlusPlus(1)
+        signs1 = _generate_signs(rng1, d)
+        perm1 = _generate_permutation(rng1, d)
+
+        # Signs must differ (probability of identical: 2^{-16} < 2e-5)
+        assert signs0 != signs1, \
+            f"seeds 0,1 produced identical sign vectors: {signs0}"
+        # Permutations must differ (probability of identical: 1/16! ~ 5e-14)
+        assert perm0 != perm1, \
+            f"seeds 0,1 produced identical permutations: {perm0}"
+
+    def test_output_not_equal_to_plain_fwht(self):
+        """RHT applies sign flip + permutation, not just FWHT.
+
+        The RHT output must differ from plain fwht(v) because the
+        sign vector and permutation scramble coordinates first.
+        """
+        import random
+        random.seed(42)
+        v = [random.gauss(0, 1) for _ in range(32)]
+
+        w_rht = rht_forward(v, seed=42)
+        w_plain = fwht(v)
+
+        diffs = sum(1 for a, b in zip(w_rht, w_plain) if abs(a - b) > 1e-12)
+        assert diffs > 0, "RHT output equals plain FWHT — signs/perm not applied"
+
+
+class TestRHTEdgeCases:
+    """Edge cases for the RHT."""
+
+    def test_d1_passthrough(self):
+        """D=1: only one sign flip possible, H_1 = [1], so v or -v."""
+        v = [3.14]
+        w = rht_forward(v, seed=0)
+        assert len(w) == 1
+        # Roundtrip must work
+        v_back = rht_inverse(w, seed=0)
+        assert abs(v_back[0] - 3.14) < 1e-12
+
+    def test_d2_roundtrip(self):
+        """D=2: smallest non-trivial case."""
+        v = [1.0, 2.0]
+        w = rht_forward(v, seed=42)
+        v_back = rht_inverse(w, seed=42)
+        assert abs(v_back[0] - 1.0) < 1e-12
+        assert abs(v_back[1] - 2.0) < 1e-12
+
+    def test_zero_vector(self):
+        """Zero vector maps to zero vector (linearity)."""
+        v = [0.0] * 32
+        w = rht_forward(v, seed=42)
+        for val in w:
+            assert abs(val) < 1e-15
+
+    def test_non_power_of_2_rejected(self):
+        """Non-power-of-2 input raises ValueError (from underlying fwht)."""
+        with pytest.raises(ValueError):
+            rht_forward([1.0, 2.0, 3.0], seed=42)
