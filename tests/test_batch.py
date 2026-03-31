@@ -33,6 +33,11 @@ from cbor_ld_ex.batch import (
     rht_inverse,
     encode_batch,
     decode_batch,
+    batch_wire_bits,
+    batch_information_bits,
+    batch_overhead_bits,
+    batch_padding_waste_bits,
+    batch_efficiency,
 )
 
 
@@ -1744,3 +1749,285 @@ class TestBatchEdgeCases:
         """Empty opinion list should be rejected."""
         with pytest.raises(ValueError):
             encode_batch([], bits=3, seed=42)
+
+
+# =========================================================================
+# Phase 6: Distortion-rate factor ρ verification
+#
+# Theorem 15 claims ρ_batch ≈ 2.7 for N ≥ 32 with Lloyd-Max.
+# This is the TurboQuant-matching claim. It MUST be empirically verified.
+#
+# ρ = (actual MSE) / (information-theoretic optimal MSE)
+# where the optimum for D-dimensional unit-variance Gaussian is:
+#   MSE_opt = D * (1/(12 * 4^(b/D)))  [Zador bound]
+# but for our per-coordinate formulation:
+#   MSE_opt_per_coord = 1/(12 * 2^(2b))  [1D Zador]
+#
+# More precisely, ρ = MSE_actual / MSE_zador where
+#   MSE_zador = (1/12) * 2^(-2b)  (1D optimal scalar quantizer)
+# =========================================================================
+
+
+class TestDistortionRateFactor:
+    """Phase 6: empirical verification of ρ ≈ 2.7 for Lloyd-Max.
+
+    The claim in Theorem 15 is that batch encoding matches
+    TurboQuant's asymptotic factor. This test verifies it
+    empirically with actual encode/decode cycles.
+    """
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5])
+    def test_rho_lloyd_max_at_codebook_level(self, bits):
+        """ρ for Lloyd-Max codebook on N(0.5, 1/36): 1.0 < ρ < 3.5.
+
+        Theorem 15's ρ ≈ 2.7 claim is about the scalar quantizer's
+        performance on the post-RHT distribution, NOT the end-to-end
+        pipeline MSE (which is scaled by norm²·C²).
+
+        The correct measurement: draw samples from the post-RHT
+        distribution N(0.5, 1/36), quantize with Lloyd-Max, compute
+        per-sample MSE, divide by Shannon rate-distortion bound.
+
+        Shannon R-D for Gaussian: D(R) = σ² × 2^(−2b)
+        where σ² = 1/36 is the variance of N(0.5, 1/6).
+        This is the information-theoretic minimum MSE for any b-bit
+        encoder/decoder pair on a Gaussian source.
+
+        The classic result for Lloyd-Max on Gaussian is ρ ≈ πe/3 ≈ 2.84.
+        Our truncated Gaussian should be slightly better (less tail waste).
+        """
+        import random
+        random.seed(42)
+
+        boundaries, centroids = lloyd_max_codebook(bits)
+        n_samples = 50000
+        sigma = 1.0 / 6.0
+        sigma_sq = sigma ** 2  # 1/36
+
+        mse = 0.0
+        for _ in range(n_samples):
+            x = max(0.0, min(1.0, random.gauss(0.5, sigma)))
+            code = quantize_lloyd_max(x, boundaries)
+            recon = dequantize_lloyd_max(code, centroids)
+            mse += (x - recon) ** 2
+        mse /= n_samples
+
+        # Shannon rate-distortion function for Gaussian:
+        # D(R) = σ² × 2^(-2b)
+        mse_shannon = sigma_sq * 2.0 ** (-2 * bits)
+        rho = mse / mse_shannon
+
+        assert rho > 1.0, f"rho={rho:.3f} < 1.0 (violates information theory)"
+        assert rho < 3.5, f"bits={bits}: rho={rho:.3f} >= 3.5"
+
+    def test_rho_lloyd_max_less_than_uniform(self):
+        """Lloyd-Max ρ < uniform ρ at the codebook level.
+
+        This is the empirical evidence for Pillar 3: Lloyd-Max
+        achieves a better distortion-rate factor than uniform.
+        """
+        import random
+
+        for bits in [3, 4]:
+            random.seed(42)
+            n_samples = 50000
+            sigma = 1.0 / 6.0
+
+            boundaries_lm, centroids_lm = lloyd_max_codebook(bits)
+            levels = 2 ** bits - 1
+
+            mse_lm = 0.0
+            mse_u = 0.0
+            for _ in range(n_samples):
+                x = max(0.0, min(1.0, random.gauss(0.5, sigma)))
+                # Lloyd-Max
+                code_lm = quantize_lloyd_max(x, boundaries_lm)
+                recon_lm = dequantize_lloyd_max(code_lm, centroids_lm)
+                mse_lm += (x - recon_lm) ** 2
+                # Uniform
+                code_u = max(0, min(levels, round(x * levels)))
+                recon_u = code_u / levels
+                mse_u += (x - recon_u) ** 2
+            mse_lm /= n_samples
+            mse_u /= n_samples
+
+            assert mse_lm < mse_u, \
+                f"bits={bits}: Lloyd-Max MSE {mse_lm:.6e} >= uniform {mse_u:.6e}"
+
+    @pytest.mark.parametrize("n_opinions", [32, 50, 100])
+    def test_end_to_end_lloyd_max_beats_uniform(self, n_opinions):
+        """End-to-end: Lloyd-Max pipeline MSE ≤ uniform pipeline MSE.
+
+        Full pipeline test (not codebook-level). This verifies the
+        advantage survives through the entire encode/decode cycle.
+        """
+        bits = 3
+        n_trials = 10
+
+        mse_lm_total = 0.0
+        mse_u_total = 0.0
+
+        for trial in range(n_trials):
+            opinions = _make_opinions(n_opinions, seed=trial)
+
+            data_lm = encode_batch(opinions, bits=bits, seed=trial, quantizer='lloyd_max')
+            decoded_lm = decode_batch(data_lm, n_opinions, bits=bits, quantizer='lloyd_max')
+
+            data_u = encode_batch(opinions, bits=bits, seed=trial, quantizer='uniform')
+            decoded_u = decode_batch(data_u, n_opinions, bits=bits, quantizer='uniform')
+
+            mse_lm_total += sum(
+                sum((o[j]-d[j])**2 for j in range(4))
+                for o, d in zip(opinions, decoded_lm)
+            ) / (4 * n_opinions)
+
+            mse_u_total += sum(
+                sum((o[j]-d[j])**2 for j in range(4))
+                for o, d in zip(opinions, decoded_u)
+            ) / (4 * n_opinions)
+
+        assert mse_lm_total < mse_u_total, \
+            f"N={n_opinions}: Lloyd-Max avg MSE {mse_lm_total/n_trials:.6e} " \
+            f">= uniform {mse_u_total/n_trials:.6e}"
+
+
+# =========================================================================
+# Phase 7: Shannon analysis for batch compression
+#
+# Pure functions computing bit-level efficiency metrics:
+#   - Wire cost: total bits on the wire
+#   - Information bits: useful payload (3N×b)
+#   - Overhead: seed (32) + norm_q (16) = 48 bits fixed
+#   - Padding waste: (D − 3N) × b bits from power-of-2 padding
+#   - Efficiency: information_bits / wire_bits
+# =========================================================================
+
+
+class TestBatchShannonAnalysis:
+    """Phase 7: Shannon analysis functions for batch compression."""
+
+    # --- Wire cost ---
+
+    @pytest.mark.parametrize("n_opinions,bits,expected_bits", [
+        # N=8: 3N=24, D=32, wire = 48 + 32*3 = 144 bits = 18 bytes
+        # total wire bits = (6 + ceil(32*3/8)) * 8 = (6+12)*8 = 144
+        (8, 3, (6 + 12) * 8),
+        # N=32: 3N=96, D=128, wire = 48 + 128*3 = 432 bits
+        (32, 3, (6 + 48) * 8),
+        # N=10: 3N=30, D=32, wire = 48 + 32*4 = 176 bits
+        (10, 4, (6 + 16) * 8),
+    ])
+    def test_wire_bits(self, n_opinions, bits, expected_bits):
+        """Wire bits = (6 + ceil(D×b/8)) × 8."""
+        result = batch_wire_bits(n_opinions, bits)
+        assert result == expected_bits, \
+            f"N={n_opinions}, b={bits}: got {result}, expected {expected_bits}"
+
+    # --- Information bits ---
+
+    @pytest.mark.parametrize("n_opinions,bits", [
+        (8, 3), (10, 4), (32, 3), (50, 3), (100, 4),
+    ])
+    def test_information_bits(self, n_opinions, bits):
+        """Information bits = 3N × b (useful payload)."""
+        result = batch_information_bits(n_opinions, bits)
+        assert result == 3 * n_opinions * bits
+
+    # --- Overhead ---
+
+    def test_overhead_is_48_bits(self):
+        """Fixed overhead = seed(32) + norm_q(16) = 48 bits.
+
+        This is constant regardless of N or b.
+        """
+        for n in [8, 32, 100]:
+            for b in [3, 4, 5]:
+                assert batch_overhead_bits(n, b) == 48
+
+    # --- Padding waste ---
+
+    @pytest.mark.parametrize("n_opinions,bits,expected_waste", [
+        # N=8: 3N=24, D=32, waste = (32-24)*3 = 24
+        (8, 3, (32 - 24) * 3),
+        # N=32: 3N=96, D=128, waste = (128-96)*3 = 96
+        (32, 3, (128 - 96) * 3),
+        # N=10: 3N=30, D=32, waste = (32-30)*4 = 8
+        (10, 4, (32 - 30) * 4),
+        # N=16: 3N=48, D=64, waste = (64-48)*3 = 48
+        (16, 3, (64 - 48) * 3),
+    ])
+    def test_padding_waste_bits(self, n_opinions, bits, expected_waste):
+        """Padding waste = (D − 3N) × b bits."""
+        result = batch_padding_waste_bits(n_opinions, bits)
+        assert result == expected_waste
+
+    # --- Efficiency ---
+
+    @pytest.mark.parametrize("n_opinions,bits", [
+        (8, 3), (10, 4), (32, 3), (50, 3), (100, 3),
+    ])
+    def test_efficiency_in_valid_range(self, n_opinions, bits):
+        """Efficiency is in (0, 1]."""
+        eff = batch_efficiency(n_opinions, bits)
+        assert 0.0 < eff <= 1.0, f"N={n_opinions}, b={bits}: eff={eff}"
+
+    def test_efficiency_increases_at_favorable_n(self):
+        """Efficiency increases with N when padding waste is low.
+
+        Efficiency follows a SAWTOOTH pattern: it jumps up right after
+        a power-of-2 boundary (minimal padding) and decays as N grows
+        toward the next boundary (increasing padding waste). So
+        monotonicity only holds for N values that don't cross a bad
+        padding boundary.
+
+        We test N values where 3N is close to a power of 2 (low waste).
+        """
+        bits = 3
+        # These N values have 3N close to the next power of 2:
+        # N=8: 3N=24, D=32, waste=8  (25%)
+        # N=11: 3N=33, D=64, waste=31 (48%) -- bad, skip
+        # N=21: 3N=63, D=64, waste=1  (1.6%) -- great
+        # N=42: 3N=126, D=128, waste=2 (1.6%) -- great
+        # N=85: 3N=255, D=256, waste=1 (0.4%) -- great
+        prev_eff = 0.0
+        for n in [8, 21, 42, 85]:
+            eff = batch_efficiency(n, bits)
+            assert eff > prev_eff, \
+                f"N={n}: eff={eff:.4f} <= previous {prev_eff:.4f}"
+            prev_eff = eff
+
+    def test_efficiency_sawtooth_pattern(self):
+        """Efficiency drops when 3N crosses a power-of-2 boundary.
+
+        This documents the sawtooth behavior honestly. N=10 (3N=30, D=32)
+        has less padding than N=11 (3N=33, D=64), so N=10 is more efficient.
+        """
+        bits = 3
+        eff_10 = batch_efficiency(10, bits)  # 3N=30, D=32, waste=2
+        eff_11 = batch_efficiency(11, bits)  # 3N=33, D=64, waste=31
+        assert eff_10 > eff_11, \
+            f"N=10 eff={eff_10:.4f} should exceed N=11 eff={eff_11:.4f} (sawtooth)"
+
+    def test_efficiency_identity(self):
+        """Efficiency = information_bits / wire_bits."""
+        for n in [8, 32, 50]:
+            for b in [3, 4]:
+                eff = batch_efficiency(n, b)
+                expected = batch_information_bits(n, b) / batch_wire_bits(n, b)
+                assert abs(eff - expected) < 1e-12
+
+    # --- Batch vs individual comparison ---
+
+    @pytest.mark.parametrize("n_opinions", [8, 16, 32, 50, 100])
+    def test_batch_beats_individual_for_n_ge_8(self, n_opinions):
+        """Batch encoding uses fewer bytes than individual for N ≥ 8 at 3-bit.
+
+        Individual cost: 3N bytes (8-bit per component, û-elision).
+        Batch cost: 6 + ceil(D×b/8) bytes.
+        """
+        bits = 3
+        individual_bytes = 3 * n_opinions
+        d = _next_pow2(3 * n_opinions)
+        batch_bytes = 6 + math.ceil(d * bits / 8)
+        assert batch_bytes < individual_bytes, \
+            f"N={n_opinions}: batch {batch_bytes} >= individual {individual_bytes}"

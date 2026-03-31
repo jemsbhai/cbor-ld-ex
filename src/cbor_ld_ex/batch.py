@@ -948,3 +948,99 @@ def decode_batch(
         result.append((b_proj, d_proj, u_proj, a_proj))
 
     return result
+
+
+# =========================================================================
+# Shannon Analysis for Batch Compression — §4.8 Phase 7
+#
+# Pure functions computing bit-level efficiency metrics.
+# These are used by the benchmark suite and paper tables.
+#
+# Wire format: seed(4) + norm_q(2) + packed_coords(ceil(D×b/8))
+#   Total: 6 + ceil(D×b/8) bytes
+#   Overhead: 48 bits (seed 32 + norm_q 16)
+#   Payload: D × b bits (of which 3N×b are useful, rest is padding)
+# =========================================================================
+
+
+def batch_wire_bits(n_opinions: int, bits: int) -> int:
+    """Total bits on the wire for a batch of N opinions.
+
+    Wire format: seed(4 bytes) + norm_q(2 bytes) + packed_coords.
+    Total = (6 + ceil(D × b / 8)) × 8 bits.
+
+    Args:
+        n_opinions: Number of opinions N.
+        bits: Quantization bit-width b.
+
+    Returns:
+        Total wire cost in bits.
+    """
+    d = _next_power_of_2(3 * n_opinions)
+    wire_bytes = 6 + (d * bits + 7) // 8
+    return wire_bytes * 8
+
+
+def batch_information_bits(n_opinions: int, bits: int) -> int:
+    """Useful information bits: 3N × b.
+
+    Each opinion contributes 3 free parameters (b, d, a),
+    each quantized at b bits.
+
+    Args:
+        n_opinions: Number of opinions N.
+        bits: Quantization bit-width b.
+
+    Returns:
+        Information payload in bits.
+    """
+    return 3 * n_opinions * bits
+
+
+def batch_overhead_bits(n_opinions: int, bits: int) -> int:
+    """Fixed overhead: seed(32 bits) + norm_q(16 bits) = 48 bits.
+
+    This is constant regardless of N or b.
+
+    Args:
+        n_opinions: Number of opinions N (unused, for API consistency).
+        bits: Quantization bit-width b (unused, for API consistency).
+
+    Returns:
+        Fixed overhead in bits (always 48).
+    """
+    return 48
+
+
+def batch_padding_waste_bits(n_opinions: int, bits: int) -> int:
+    """Wasted bits from power-of-2 padding: (D − 3N) × b.
+
+    The padded dimension D = 2^ceil(log2(3N)) may exceed 3N,
+    resulting in zero-padded coordinates that consume wire bits
+    but carry no information.
+
+    Args:
+        n_opinions: Number of opinions N.
+        bits: Quantization bit-width b.
+
+    Returns:
+        Padding waste in bits.
+    """
+    d = _next_power_of_2(3 * n_opinions)
+    return (d - 3 * n_opinions) * bits
+
+
+def batch_efficiency(n_opinions: int, bits: int) -> float:
+    """Shannon efficiency: information_bits / wire_bits.
+
+    Measures what fraction of wire bits carry useful information.
+    Bounded in (0, 1]. Increases with N as overhead is amortized.
+
+    Args:
+        n_opinions: Number of opinions N.
+        bits: Quantization bit-width b.
+
+    Returns:
+        Efficiency ratio in (0, 1].
+    """
+    return batch_information_bits(n_opinions, bits) / batch_wire_bits(n_opinions, bits)
