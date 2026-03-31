@@ -198,6 +198,7 @@ class Xoshiro128PlusPlus:
 
 import bisect as _bisect
 import math as _math
+import struct as _struct
 
 
 def _is_power_of_2(n: int) -> bool:
@@ -688,3 +689,262 @@ def rht_inverse(w: list[float], seed: int) -> list[float]:
 
     # Undo permutation: v[perm[k]] = unsigned[k], i.e. v[j] = unsigned[inv_perm[j]]
     return [unsigned[inv_perm[k]] for k in range(d)]
+
+
+# =========================================================================
+# Batch Encode/Decode Pipeline — §4.8 Phase 5b
+#
+# Full pipeline: stack → pad → RHT → normalize → quantize → pack (encode)
+#                unpack → dequantize → denormalize → inv RHT → unpad →
+#                restore constraints (decode)
+#
+# Wire format (§4.8.4, Definition 35):
+#   [4 bytes]  seed (uint32, big-endian)
+#   [2 bytes]  norm_q (uint16, big-endian)
+#   [ceil(D × b / 8) bytes]  packed quantized coordinates (MSB-first)
+#
+# Total: 6 + ceil(D×b/8) bytes. No extra bytes.
+# =========================================================================
+
+
+def _f32(x: float) -> float:
+    """Round-trip through IEEE 754 float32 for cross-platform determinism.
+
+    The spec mandates float32 for C and norm computations (§4.8.4).
+    """
+    return _struct.unpack('>f', _struct.pack('>f', x))[0]
+
+
+def _next_power_of_2(n: int) -> int:
+    """Smallest power of 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _pack_codes(codes: list[int], bits: int) -> bytes:
+    """Pack quantized codes into bytes, MSB-first.
+
+    Each code is `bits` wide. Codes are written left-to-right into
+    a byte stream, MSB-first. Trailing bits in the last byte are
+    zero-padded.
+
+    Args:
+        codes: List of quantized codes, each in [0, 2^bits - 1].
+        bits: Bits per code.
+
+    Returns:
+        Packed bytes of length ceil(len(codes) * bits / 8).
+    """
+    total_bits = len(codes) * bits
+    n_bytes = (total_bits + 7) // 8
+    buf = bytearray(n_bytes)
+
+    bit_pos = 0  # current bit position in the output stream
+    for code in codes:
+        # Write `bits` bits of `code` starting at `bit_pos`
+        for b in range(bits - 1, -1, -1):  # MSB first
+            bit_val = (code >> b) & 1
+            byte_idx = bit_pos >> 3
+            bit_idx = 7 - (bit_pos & 7)  # MSB-first within each byte
+            buf[byte_idx] |= bit_val << bit_idx
+            bit_pos += 1
+
+    return bytes(buf)
+
+
+def _unpack_codes(data: bytes, n_codes: int, bits: int) -> list[int]:
+    """Unpack quantized codes from bytes, MSB-first.
+
+    Inverse of _pack_codes.
+
+    Args:
+        data: Packed byte data.
+        n_codes: Number of codes to extract.
+        bits: Bits per code.
+
+    Returns:
+        List of n_codes integer codes.
+    """
+    codes = []
+    bit_pos = 0
+    for _ in range(n_codes):
+        code = 0
+        for _ in range(bits):
+            byte_idx = bit_pos >> 3
+            bit_idx = 7 - (bit_pos & 7)
+            code = (code << 1) | ((data[byte_idx] >> bit_idx) & 1)
+            bit_pos += 1
+        codes.append(code)
+    return codes
+
+
+def encode_batch(
+    opinions: list[tuple[float, float, float, float]],
+    bits: int,
+    seed: int | None = None,
+    quantizer: str = 'lloyd_max',
+) -> bytes:
+    """Encode a batch of SL opinions into compact wire format.
+
+    Pipeline (Definition 34 + 35):
+      1. Stack (b, d, a) from each opinion into v \u2208 \u211d^(3N)
+      2. Pad to D = 2^\u2308log\u2082(3N)\u2309 with zeros
+      3. RHT: w = H_D \u00b7 (\u03c3 \u2299 P(v_padded))
+      4. Normalize: x_j = w_j / (norm \u00d7 C) + 0.5, clamp to [0,1]
+      5. Quantize each x_j at b bits
+      6. Pack into wire format: seed(4) + norm_q(2) + packed_coords
+
+    Args:
+        opinions: List of N opinions, each (b, d, u, a) with b+d+u=1.
+        bits: Quantization bit-width per coordinate (2\u20138).
+        seed: uint32 PRNG seed, or None for random.
+        quantizer: 'lloyd_max' (default) or 'uniform'.
+
+    Returns:
+        Wire bytes of length 6 + ceil(D \u00d7 bits / 8).
+
+    Raises:
+        ValueError: If opinions is empty.
+    """
+    if not opinions:
+        raise ValueError("opinions must be non-empty")
+
+    n = len(opinions)
+
+    # Generate seed if needed
+    if seed is None:
+        import os
+        seed = _struct.unpack('>I', os.urandom(4))[0]
+    seed = seed & _U32_MASK
+
+    # Step 1: Stack free parameters (b, d, a) — u is derived on decode
+    v = []
+    for b_val, d_val, u_val, a_val in opinions:
+        v.extend([b_val, d_val, a_val])
+
+    # Step 2: Pad to power of 2
+    d = _next_power_of_2(3 * n)
+    v_padded = v + [0.0] * (d - len(v))
+
+    # Compute L2 norm of the stacked vector (before RHT, but RHT preserves it)
+    norm = _math.sqrt(sum(x * x for x in v_padded))
+
+    # Step 3: RHT
+    w = rht_forward(v_padded, seed)
+
+    # Step 4: Normalize to [0, 1]
+    c_const = _f32(6.0 / _math.sqrt(float(d)))  # IEEE 754 float32
+
+    if norm < 1e-30:
+        # Degenerate case: all-zero input
+        x_norm = [0.5] * d
+    else:
+        denom = norm * c_const
+        x_norm = [max(0.0, min(1.0, w_j / denom + 0.5)) for w_j in w]
+
+    # Step 5: Quantize
+    if quantizer == 'uniform':
+        levels = 2 ** bits - 1
+        codes = [max(0, min(levels, round(x * levels))) for x in x_norm]
+    elif quantizer == 'lloyd_max':
+        boundaries, _ = lloyd_max_codebook(bits, dim=d)
+        codes = [quantize_lloyd_max(x, boundaries) for x in x_norm]
+    else:
+        raise ValueError(f"Unknown quantizer: {quantizer!r}")
+
+    # Step 6: Norm quantization (§4.8.4)
+    norm_max = _f32(_math.sqrt(float(3 * n)))  # float32
+    if norm_max < 1e-30:
+        norm_q = 0
+    else:
+        norm_q = max(0, min(65535, round(norm / norm_max * 65535)))
+
+    # Pack wire format
+    header = _struct.pack('>IH', seed, norm_q)
+    packed = _pack_codes(codes, bits)
+
+    return header + packed
+
+
+def decode_batch(
+    data: bytes,
+    n_opinions: int,
+    bits: int,
+    quantizer: str = 'lloyd_max',
+) -> list[tuple[float, float, float, float]]:
+    """Decode a batch of SL opinions from wire format.
+
+    Pipeline (inverse of encode_batch):
+      1. Unpack seed, norm_q, quantized coordinates
+      2. Dequantize each coordinate
+      3. Denormalize: w_j = (x_j - 0.5) \u00d7 norm \u00d7 C
+      4. Inverse RHT: v_padded = P\u207b\u00b9(\u03c3 \u2299 H_D \u00b7 w)
+      5. Unpad: take first 3N values
+      6. Restore constraints (Definition 36):
+         Step A: simplex_project([b\u0303, d\u0303, 1\u2212b\u0303\u2212d\u0303])
+         Step B: clamp a\u0303 to [0, 1]
+
+    Args:
+        data: Wire bytes from encode_batch.
+        n_opinions: Number of opinions N that were encoded.
+        bits: Quantization bit-width per coordinate.
+        quantizer: 'lloyd_max' (default) or 'uniform'.
+
+    Returns:
+        List of N opinions, each (b, d, u, a) with b+d+u=1, a \u2208 [0,1].
+    """
+    # Unpack header
+    seed, norm_q = _struct.unpack('>IH', data[:6])
+
+    # Compute padded dimension
+    d = _next_power_of_2(3 * n_opinions)
+
+    # Unpack quantized coordinates
+    codes = _unpack_codes(data[6:], d, bits)
+
+    # Dequantize
+    if quantizer == 'uniform':
+        levels = 2 ** bits - 1
+        x_dequant = [code / levels for code in codes]
+    elif quantizer == 'lloyd_max':
+        _, centroids = lloyd_max_codebook(bits, dim=d)
+        x_dequant = [dequantize_lloyd_max(code, centroids) for code in codes]
+    else:
+        raise ValueError(f"Unknown quantizer: {quantizer!r}")
+
+    # Reconstruct norm
+    norm_max = _f32(_math.sqrt(float(3 * n_opinions)))
+    norm = float(norm_q) / 65535.0 * norm_max
+
+    # Denormalize
+    c_const = _f32(6.0 / _math.sqrt(float(d)))
+
+    if norm < 1e-30:
+        w = [0.0] * d
+    else:
+        denom = norm * c_const
+        w = [(x - 0.5) * denom for x in x_dequant]
+
+    # Inverse RHT
+    v_padded = rht_inverse(w, seed)
+
+    # Unpad and restore constraints (Definition 36)
+    result = []
+    for i in range(n_opinions):
+        b_raw = v_padded[3 * i]
+        d_raw = v_padded[3 * i + 1]
+        a_raw = v_padded[3 * i + 2]
+
+        # Step A: simplex projection for (b, d, u)
+        u_raw = 1.0 - b_raw - d_raw
+        projected = simplex_project([b_raw, d_raw, u_raw])
+        b_proj, d_proj, u_proj = projected[0], projected[1], projected[2]
+
+        # Step B: clamp base rate
+        a_proj = max(0.0, min(1.0, a_raw))
+
+        result.append((b_proj, d_proj, u_proj, a_proj))
+
+    return result

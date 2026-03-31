@@ -31,6 +31,8 @@ from cbor_ld_ex.batch import (
     dequantize_lloyd_max,
     rht_forward,
     rht_inverse,
+    encode_batch,
+    decode_batch,
 )
 
 
@@ -1321,3 +1323,424 @@ class TestRHTEdgeCases:
         """Non-power-of-2 input raises ValueError (from underlying fwht)."""
         with pytest.raises(ValueError):
             rht_forward([1.0, 2.0, 3.0], seed=42)
+
+
+# =========================================================================
+# Batch Encode/Decode Pipeline — §4.8 Phase 5b
+#
+# Full pipeline combining all primitives:
+#   Encode: stack → pad → RHT → normalize → quantize → pack
+#   Decode: unpack → dequantize → denormalize → inv RHT → unpad → restore
+#
+# Wire format (§4.8.4, Definition 35):
+#   [4 bytes]  seed (uint32)
+#   [2 bytes]  norm_q (uint16)
+#   [ceil(D × b / 8) bytes]  packed quantized coordinates
+#   Total: 6 + ceil(D×b/8) bytes. No extra bytes. Period.
+#
+# Constraint restoration (§4.8.5, Definition 36):
+#   Step A: L2 simplex projection for (b, d, u)
+#   Step B: Clamp a to [0, 1]
+# =========================================================================
+
+
+def _make_opinions(n, seed=42):
+    """Generate n random valid SL opinions for testing.
+
+    Returns list of (b, d, u, a) with b+d+u=1, all ≥ 0, a ∈ [0,1].
+    """
+    import random
+    random.seed(seed)
+    opinions = []
+    for _ in range(n):
+        # Random simplex point via Dirichlet(1,1,1)
+        raw = [random.expovariate(1.0) for _ in range(3)]
+        total = sum(raw)
+        b, d, u = raw[0] / total, raw[1] / total, raw[2] / total
+        a = random.random()
+        opinions.append((b, d, u, a))
+    return opinions
+
+
+def _next_pow2(n: int) -> int:
+    """Next power of 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+class TestBatchWireFormat:
+    """Phase 5b: Wire format correctness.
+
+    The wire format is exactly 6 + ceil(D×b/8) bytes.
+    No batch header. No quantizer flag. No extra padding.
+    Every byte is accounted for.
+    """
+
+    @pytest.mark.parametrize("n_opinions,bits", [
+        (8, 3), (10, 3), (10, 4), (20, 3), (32, 3),
+        (32, 4), (50, 3), (100, 3),
+    ])
+    def test_wire_size_exact(self, n_opinions, bits):
+        """Wire size = 6 + ceil(D × b / 8) bytes, no more, no less."""
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits, seed=42)
+
+        d = _next_pow2(3 * n_opinions)
+        expected_size = 6 + math.ceil(d * bits / 8)
+        assert len(data) == expected_size, \
+            f"N={n_opinions}, b={bits}: got {len(data)} bytes, " \
+            f"expected {expected_size} (D={d})"
+
+    def test_seed_embedded_in_first_4_bytes(self):
+        """The seed is stored big-endian in the first 4 bytes."""
+        import struct
+        opinions = _make_opinions(10)
+        seed = 0xDEADBEEF
+        data = encode_batch(opinions, bits=3, seed=seed)
+        embedded_seed = struct.unpack('>I', data[:4])[0]
+        assert embedded_seed == seed, \
+            f"Expected seed 0x{seed:08X}, got 0x{embedded_seed:08X}"
+
+    def test_norm_in_bytes_4_5(self):
+        """Bytes 4–5 contain the uint16 quantized norm."""
+        import struct
+        opinions = _make_opinions(10)
+        data = encode_batch(opinions, bits=3, seed=42)
+        norm_q = struct.unpack('>H', data[4:6])[0]
+        # Norm of 30 opinion values in [0,1] should be positive
+        assert 0 < norm_q <= 65535
+
+
+class TestBatchRoundtrip:
+    """Phase 5b: encode → decode recovers opinions within quantization tolerance.
+
+    The tolerance depends on bit-width: more bits → lower error.
+    At 3 bits with 8 levels, per-coordinate error ≤ 1/(2×7) ≈ 0.071.
+    After RHT mixing + norm quantization, per-opinion error is larger
+    but bounded.
+    """
+
+    @pytest.mark.parametrize("n_opinions,bits,quantizer", [
+        (8, 3, 'uniform'), (10, 3, 'uniform'), (20, 4, 'uniform'),
+        (32, 3, 'uniform'), (50, 4, 'uniform'),
+        (8, 3, 'lloyd_max'), (10, 4, 'lloyd_max'), (20, 3, 'lloyd_max'),
+        (32, 4, 'lloyd_max'), (50, 3, 'lloyd_max'),
+    ])
+    def test_total_mse_within_theoretical_bound(self, n_opinions, bits, quantizer):
+        """Total MSE over free parameters (b, d, a) is within derived bound.
+
+        Derivation:
+          After RHT + quantization + inverse RHT, the error budget is:
+
+          1. Each of D rotated coordinates has quantization error |e_j|.
+             For uniform: |e_j| <= 1/(2(2^b - 1)).
+             For Lloyd-Max: e_j is smaller on average, but bounded same.
+          2. RHT is orthogonal: ||v - v_recon||^2 = ||w - w_recon||^2
+          3. Denormalization scales each error by norm * C:
+             ||v - v_recon||^2 = (norm*C)^2 * sum(e_j^2)
+          4. C = 6/sqrt(D), so C^2 = 36/D. Therefore:
+             ||v - v_recon||^2 = norm^2 * (36/D) * sum(e_j^2)
+          5. Worst case: sum(e_j^2) <= D/(4(2^b-1)^2)
+             => ||v - v_recon||^2 <= 9 * norm^2 / (2^b - 1)^2
+
+          Per-opinion MSE = ||v - v_recon||^2 / N
+
+          Norm quantization adds epsilon_norm ~ O(10^-8), negligible.
+          Simplex projection does not increase MSE (Theorem 14).
+
+        This bound is tight: it depends only on ||v||^2, N, and b.
+        The D factor cancels from the C normalization.
+        """
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits=bits, seed=42, quantizer=quantizer)
+        decoded = decode_batch(data, n_opinions, bits=bits, quantizer=quantizer)
+
+        # Compute actual total MSE over free parameters (b, d, a)
+        # Note: u is derived, so we check (b, d, u, a) but the bound
+        # is derived from the 3 free parameters (b, d, a) in the stacked vector
+        actual_mse = sum(
+            (orig[0] - dec[0])**2 + (orig[1] - dec[1])**2 + (orig[3] - dec[3])**2
+            for orig, dec in zip(opinions, decoded)
+        ) / n_opinions
+
+        # Compute ||v||^2 = sum of b_i^2 + d_i^2 + a_i^2
+        v_norm_sq = sum(
+            o[0]**2 + o[1]**2 + o[3]**2 for o in opinions
+        )
+
+        # Theoretical bound: 9 * ||v||^2 / (N * (2^b - 1)^2)
+        k_minus_1 = 2**bits - 1
+        theoretical_bound = 9.0 * v_norm_sq / (n_opinions * k_minus_1**2)
+
+        # Add norm quantization margin: (norm_max / (2*65535))^2 * 36
+        # This is a small second-order term
+        norm_max = math.sqrt(3.0 * n_opinions)
+        norm_err = norm_max / (2 * 65535)
+        norm_margin = 36.0 * norm_err**2  # scales through C^2 * D = 36
+        bound = theoretical_bound + norm_margin
+
+        assert actual_mse <= bound, \
+            f"N={n_opinions}, b={bits}, q={quantizer}: " \
+            f"MSE {actual_mse:.6e} > bound {bound:.6e} " \
+            f"(theoretical {theoretical_bound:.6e})"
+
+    @pytest.mark.parametrize("n_opinions,bits", [
+        (8, 3), (20, 4), (32, 3), (50, 4),
+    ])
+    def test_u_component_mse_bounded_by_free_param_mse(self, n_opinions, bits):
+        """Theorem 14: simplex projection does not amplify MSE.
+
+        The u component is derived as u = 1 - b - d. After reconstruction,
+        u_raw = 1 - b_raw - d_raw. Simplex projection yields (b_proj, d_proj,
+        u_proj) with ||proj - true||^2 <= ||raw - true||^2.
+
+        Therefore per-opinion MSE over (b, d, u) <= per-opinion MSE over
+        (b_raw, d_raw, u_raw), which is bounded by the free-parameter
+        MSE (since u_raw = 1 - b_raw - d_raw and u_true = 1 - b - d,
+        the u_raw error is ||e_b + e_d|| which is at most 2x the
+        free-parameter error).
+        """
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits=bits, seed=42)
+        decoded = decode_batch(data, n_opinions, bits=bits)
+
+        # MSE over (b, d, u)
+        mse_bdu = sum(
+            (orig[0] - dec[0])**2 +
+            (orig[1] - dec[1])**2 +
+            (orig[2] - dec[2])**2
+            for orig, dec in zip(opinions, decoded)
+        ) / n_opinions
+
+        # MSE over (b, d, a) — the free parameters
+        mse_free = sum(
+            (orig[0] - dec[0])**2 +
+            (orig[1] - dec[1])**2 +
+            (orig[3] - dec[3])**2
+            for orig, dec in zip(opinions, decoded)
+        ) / n_opinions
+
+        # The (b,d,u) MSE should be comparable to free-param MSE.
+        # Simplex projection guarantees (b,d,u) MSE <= pre-projection MSE.
+        # Pre-projection u error = -(e_b + e_d), so pre-projection
+        # (b,d,u) MSE = e_b^2 + e_d^2 + (e_b+e_d)^2 <= 3*(e_b^2+e_d^2)
+        # plus the a error is independent, so:
+        # mse_bdu <= 3 * mse_free is a safe bound
+        assert mse_bdu <= 3 * mse_free + 1e-10, \
+            f"N={n_opinions}, b={bits}: bdu MSE {mse_bdu:.6e} > 3 * free MSE {mse_free:.6e}"
+
+    def test_higher_bits_lower_mse(self):
+        """More bits → strictly lower total MSE (monotonicity)."""
+        opinions = _make_opinions(32)
+        prev_mse = float('inf')
+
+        for bits in [3, 4, 5, 6]:
+            data = encode_batch(opinions, bits=bits, seed=42)
+            decoded = decode_batch(data, 32, bits=bits)
+
+            mse = sum(
+                sum((o[j] - d[j])**2 for j in range(4))
+                for o, d in zip(opinions, decoded)
+            ) / (32 * 4)
+
+            assert mse < prev_mse, \
+                f"bits={bits}: MSE {mse:.6e} >= previous {prev_mse:.6e}"
+            prev_mse = mse
+
+    def test_lloyd_max_mse_leq_uniform_mse(self):
+        """Lloyd-Max should achieve MSE <= uniform at same bit-width.
+
+        This is the whole point of Lloyd-Max optimization.
+        """
+        opinions = _make_opinions(32)
+
+        for bits in [3, 4]:
+            data_u = encode_batch(opinions, bits=bits, seed=42, quantizer='uniform')
+            decoded_u = decode_batch(data_u, 32, bits=bits, quantizer='uniform')
+
+            data_lm = encode_batch(opinions, bits=bits, seed=42, quantizer='lloyd_max')
+            decoded_lm = decode_batch(data_lm, 32, bits=bits, quantizer='lloyd_max')
+
+            mse_u = sum(
+                sum((o[j] - d[j])**2 for j in range(4))
+                for o, d in zip(opinions, decoded_u)
+            ) / (32 * 4)
+
+            mse_lm = sum(
+                sum((o[j] - d[j])**2 for j in range(4))
+                for o, d in zip(opinions, decoded_lm)
+            ) / (32 * 4)
+
+            assert mse_lm <= mse_u * (1 + 1e-3), \
+                f"bits={bits}: Lloyd-Max MSE {mse_lm:.6e} > uniform {mse_u:.6e}"
+
+
+class TestBatchConstraintPreservation:
+    """Phase 5b: Axiom 3 (b+d+u=1) and base rate validity (a ∈ [0,1]).
+
+    This is a NON-NEGOTIABLE guarantee: every decoded opinion is a valid
+    SL opinion, regardless of quantization noise. Enforced by simplex
+    projection (Step A) and base rate clamping (Step B) of Definition 36.
+    """
+
+    @pytest.mark.parametrize("n_opinions,bits,quantizer", [
+        (8, 3, 'uniform'), (10, 3, 'uniform'), (32, 3, 'uniform'),
+        (50, 4, 'uniform'), (100, 3, 'uniform'),
+        (8, 3, 'lloyd_max'), (32, 4, 'lloyd_max'), (50, 3, 'lloyd_max'),
+    ])
+    def test_axiom3_exact(self, n_opinions, bits, quantizer):
+        """Every decoded opinion satisfies b+d+u=1 exactly."""
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits=bits, seed=42, quantizer=quantizer)
+        decoded = decode_batch(data, n_opinions, bits=bits, quantizer=quantizer)
+
+        for i, (b, d, u, a) in enumerate(decoded):
+            total = b + d + u
+            assert abs(total - 1.0) < 1e-12, \
+                f"opinion {i}: b+d+u = {total} (quantizer={quantizer})"
+
+    @pytest.mark.parametrize("n_opinions,bits,quantizer", [
+        (8, 3, 'uniform'), (32, 4, 'uniform'),
+        (8, 3, 'lloyd_max'), (32, 4, 'lloyd_max'),
+    ])
+    def test_components_non_negative(self, n_opinions, bits, quantizer):
+        """Every decoded b, d, u ≥ 0."""
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits=bits, seed=42, quantizer=quantizer)
+        decoded = decode_batch(data, n_opinions, bits=bits, quantizer=quantizer)
+
+        for i, (b, d, u, a) in enumerate(decoded):
+            assert b >= -1e-12, f"opinion {i}: b = {b}"
+            assert d >= -1e-12, f"opinion {i}: d = {d}"
+            assert u >= -1e-12, f"opinion {i}: u = {u}"
+
+    @pytest.mark.parametrize("n_opinions,bits,quantizer", [
+        (8, 3, 'uniform'), (32, 4, 'uniform'),
+        (8, 3, 'lloyd_max'), (32, 4, 'lloyd_max'),
+    ])
+    def test_base_rate_in_unit_interval(self, n_opinions, bits, quantizer):
+        """Every decoded a ∈ [0, 1]."""
+        opinions = _make_opinions(n_opinions)
+        data = encode_batch(opinions, bits=bits, seed=42, quantizer=quantizer)
+        decoded = decode_batch(data, n_opinions, bits=bits, quantizer=quantizer)
+
+        for i, (b, d, u, a) in enumerate(decoded):
+            assert -1e-12 <= a <= 1.0 + 1e-12, \
+                f"opinion {i}: a = {a}"
+
+
+class TestBatchDeterminism:
+    """Phase 5b: deterministic encoding.
+
+    Same opinions + same seed = identical bytes.
+    Protocol-mandated for decoder interoperability.
+    """
+
+    def test_same_seed_identical_bytes(self):
+        """Two encodes with same seed produce identical wire bytes."""
+        opinions = _make_opinions(20)
+        data1 = encode_batch(opinions, bits=3, seed=42)
+        data2 = encode_batch(opinions, bits=3, seed=42)
+        assert data1 == data2
+
+    def test_different_seeds_different_bytes(self):
+        """Different seeds produce different wire bytes."""
+        opinions = _make_opinions(20)
+        data1 = encode_batch(opinions, bits=3, seed=42)
+        data2 = encode_batch(opinions, bits=3, seed=43)
+        # Seeds differ (first 4 bytes), and rotated coords differ
+        assert data1 != data2
+
+    def test_auto_seed_is_random(self):
+        """When seed=None, a random seed is generated and embedded."""
+        import struct
+        opinions = _make_opinions(10)
+        data1 = encode_batch(opinions, bits=3)
+        data2 = encode_batch(opinions, bits=3)
+
+        seed1 = struct.unpack('>I', data1[:4])[0]
+        seed2 = struct.unpack('>I', data2[:4])[0]
+        # Overwhelmingly likely to differ
+        assert seed1 != seed2, "Two auto-seeds were identical"
+
+    def test_auto_seed_roundtrips(self):
+        """Auto-seeded encoding can be decoded (seed read from wire).
+
+        Verifies that the seed embedded in the wire format is sufficient
+        for the decoder. Uses the same MSE bound as test_total_mse.
+        """
+        opinions = _make_opinions(20)
+        data = encode_batch(opinions, bits=4)
+        decoded = decode_batch(data, 20, bits=4)
+
+        assert len(decoded) == 20
+
+        # MSE check (same bound derivation as test_total_mse)
+        v_norm_sq = sum(o[0]**2 + o[1]**2 + o[3]**2 for o in opinions)
+        k_minus_1 = 2**4 - 1
+        bound = 9.0 * v_norm_sq / (20 * k_minus_1**2) + 1e-6
+        actual_mse = sum(
+            (orig[0]-dec[0])**2 + (orig[1]-dec[1])**2 + (orig[3]-dec[3])**2
+            for orig, dec in zip(opinions, decoded)
+        ) / 20
+        assert actual_mse <= bound, \
+            f"Auto-seed MSE {actual_mse:.6e} > bound {bound:.6e}"
+
+
+class TestBatchEdgeCases:
+    """Phase 5b: edge cases and input validation."""
+
+    def test_minimum_batch_size(self):
+        """N=1: single opinion batch (D=4 after padding 3→4)."""
+        opinions = [(0.3, 0.2, 0.5, 0.7)]
+        data = encode_batch(opinions, bits=4, seed=42)
+
+        d = _next_pow2(3)  # = 4
+        assert len(data) == 6 + math.ceil(d * 4 / 8)
+
+        decoded = decode_batch(data, 1, bits=4)
+        b, d_val, u, a = decoded[0]
+        assert abs(b + d_val + u - 1.0) < 1e-12
+        assert 0.0 <= a <= 1.0
+
+    def test_exact_power_of_2_opinions(self):
+        """N where 3N is already a power of 2: no padding waste.
+
+        3N = 2^k → N = 2^k/3. Doesn't happen for integer N,
+        but 3*16 = 48, next pow2 = 64. Test N=16.
+        """
+        opinions = _make_opinions(16)
+        data = encode_batch(opinions, bits=3, seed=42)
+        decoded = decode_batch(data, 16, bits=3)
+
+        assert len(decoded) == 16
+        for b, d, u, a in decoded:
+            assert abs(b + d + u - 1.0) < 1e-12
+
+    def test_extreme_opinions(self):
+        """Opinions at simplex vertices and edges."""
+        opinions = [
+            (1.0, 0.0, 0.0, 0.0),  # pure belief
+            (0.0, 1.0, 0.0, 0.5),  # pure disbelief
+            (0.0, 0.0, 1.0, 1.0),  # pure uncertainty
+            (0.5, 0.5, 0.0, 0.3),  # edge: no uncertainty
+            (0.0, 0.0, 1.0, 0.0),  # vacuous, a=0
+            (0.0, 0.0, 1.0, 1.0),  # vacuous, a=1
+            (1/3, 1/3, 1/3, 0.5),  # uniform
+            (0.0, 0.5, 0.5, 0.5),  # edge: no belief
+        ]
+        data = encode_batch(opinions, bits=4, seed=42)
+        decoded = decode_batch(data, 8, bits=4)
+
+        for i, (b, d, u, a) in enumerate(decoded):
+            assert abs(b + d + u - 1.0) < 1e-12, \
+                f"extreme opinion {i}: b+d+u = {b+d+u}"
+            assert b >= -1e-12 and d >= -1e-12 and u >= -1e-12
+            assert -1e-12 <= a <= 1.0 + 1e-12
+
+    def test_empty_opinions_rejected(self):
+        """Empty opinion list should be rejected."""
+        with pytest.raises(ValueError):
+            encode_batch([], bits=3, seed=42)
