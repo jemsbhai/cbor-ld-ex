@@ -698,8 +698,10 @@ def rht_inverse(w: list[float], seed: int) -> list[float]:
 #                unpack → dequantize → denormalize → inv RHT → unpad →
 #                restore constraints (decode)
 #
-# Wire format (§4.8.4, Definition 35):
-#   [4 bytes]  seed (uint32, big-endian)
+# Wire format (§4.8.4, Definition 35, spec v0.4.5):
+#   [4 bytes]  seed_mode (uint32, big-endian):
+#              Bit 31 (MSB): quantizer mode (0=uniform, 1=Lloyd-Max)
+#              Bits 30–0: PRNG seed for RHT (31-bit range)
 #   [2 bytes]  norm_q (uint16, big-endian)
 #   [ceil(D × b / 8) bytes]  packed quantized coordinates (MSB-first)
 #
@@ -794,12 +796,12 @@ def encode_batch(
       3. RHT: w = H_D \u00b7 (\u03c3 \u2299 P(v_padded))
       4. Normalize: x_j = w_j / (norm \u00d7 C) + 0.5, clamp to [0,1]
       5. Quantize each x_j at b bits
-      6. Pack into wire format: seed(4) + norm_q(2) + packed_coords
+      6. Pack into wire format: seed_mode(4) + norm_q(2) + packed_coords
 
     Args:
         opinions: List of N opinions, each (b, d, u, a) with b+d+u=1.
         bits: Quantization bit-width per coordinate (2\u20138).
-        seed: uint32 PRNG seed, or None for random.
+        seed: PRNG seed (31-bit, range [0, 2^31-1]), or None for random.
         quantizer: 'lloyd_max' (default) or 'uniform'.
 
     Returns:
@@ -817,7 +819,7 @@ def encode_batch(
     if seed is None:
         import os
         seed = _struct.unpack('>I', os.urandom(4))[0]
-    seed = seed & _U32_MASK
+    seed = seed & 0x7FFFFFFF  # 31-bit seed (MSB reserved for mode flag)
 
     # Step 1: Stack free parameters (b, d, a) — u is derived on decode
     v = []
@@ -861,8 +863,10 @@ def encode_batch(
     else:
         norm_q = max(0, min(65535, round(norm / norm_max * 65535)))
 
-    # Pack wire format
-    header = _struct.pack('>IH', seed, norm_q)
+    # Pack wire format (spec v0.4.5: seed MSB = quantizer mode flag)
+    mode_bit = 1 if quantizer == 'lloyd_max' else 0
+    seed_mode = (mode_bit << 31) | seed
+    header = _struct.pack('>IH', seed_mode, norm_q)
     packed = _pack_codes(codes, bits)
 
     return header + packed
@@ -872,7 +876,7 @@ def decode_batch(
     data: bytes,
     n_opinions: int,
     bits: int,
-    quantizer: str = 'lloyd_max',
+    quantizer: str | None = None,
 ) -> list[tuple[float, float, float, float]]:
     """Decode a batch of SL opinions from wire format.
 
@@ -895,8 +899,20 @@ def decode_batch(
     Returns:
         List of N opinions, each (b, d, u, a) with b+d+u=1, a \u2208 [0,1].
     """
-    # Unpack header
-    seed, norm_q = _struct.unpack('>IH', data[:6])
+    # Unpack header (spec v0.4.5: seed MSB = quantizer mode flag)
+    seed_mode, norm_q = _struct.unpack('>IH', data[:6])
+    wire_mode = seed_mode >> 31
+    seed = seed_mode & 0x7FFFFFFF
+
+    # Auto-detect or validate quantizer from wire mode flag
+    wire_quantizer = 'lloyd_max' if wire_mode == 1 else 'uniform'
+    if quantizer is None:
+        quantizer = wire_quantizer
+    elif quantizer != wire_quantizer:
+        raise ValueError(
+            f"Quantizer mode mismatch: wire indicates '{wire_quantizer}' "
+            f"(mode={wire_mode}) but quantizer='{quantizer}' was requested"
+        )
 
     # Compute padded dimension
     d = _next_power_of_2(3 * n_opinions)
@@ -956,7 +972,7 @@ def decode_batch(
 # Pure functions computing bit-level efficiency metrics.
 # These are used by the benchmark suite and paper tables.
 #
-# Wire format: seed(4) + norm_q(2) + packed_coords(ceil(D×b/8))
+# Wire format: seed_mode(4) + norm_q(2) + packed_coords(ceil(D×b/8))
 #   Total: 6 + ceil(D×b/8) bytes
 #   Overhead: 48 bits (seed 32 + norm_q 16)
 #   Payload: D × b bits (of which 3N×b are useful, rest is padding)
@@ -966,7 +982,7 @@ def decode_batch(
 def batch_wire_bits(n_opinions: int, bits: int) -> int:
     """Total bits on the wire for a batch of N opinions.
 
-    Wire format: seed(4 bytes) + norm_q(2 bytes) + packed_coords.
+    Wire format: seed_mode(4 bytes) + norm_q(2 bytes) + packed_coords.
     Total = (6 + ceil(D × b / 8)) × 8 bits.
 
     Args:

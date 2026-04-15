@@ -1379,7 +1379,7 @@ class TestBatchWireFormat:
     """Phase 5b: Wire format correctness.
 
     The wire format is exactly 6 + ceil(D×b/8) bytes.
-    No batch header. No quantizer flag. No extra padding.
+    Seed MSB carries the quantizer mode flag (v0.4.5).
     Every byte is accounted for.
     """
 
@@ -1398,15 +1398,28 @@ class TestBatchWireFormat:
             f"N={n_opinions}, b={bits}: got {len(data)} bytes, " \
             f"expected {expected_size} (D={d})"
 
-    def test_seed_embedded_in_first_4_bytes(self):
-        """The seed is stored big-endian in the first 4 bytes."""
+    def test_seed_and_mode_in_first_4_bytes(self):
+        """First 4 bytes = seed_mode: MSB is mode flag, bits 30-0 are seed.
+
+        v0.4.5: The old test used 0xDEADBEEF and expected exact match,
+        which passed by coincidence (MSB=1 matched lloyd_max mode=1).
+        This test explicitly verifies the mode flag and masked seed.
+        """
         import struct
         opinions = _make_opinions(10)
-        seed = 0xDEADBEEF
-        data = encode_batch(opinions, bits=3, seed=seed)
-        embedded_seed = struct.unpack('>I', data[:4])[0]
-        assert embedded_seed == seed, \
-            f"Expected seed 0x{seed:08X}, got 0x{embedded_seed:08X}"
+        seed = 0x12345678  # MSB=0, no ambiguity
+        data = encode_batch(opinions, bits=3, seed=seed, quantizer='lloyd_max')
+        seed_mode = struct.unpack('>I', data[:4])[0]
+        assert seed_mode >> 31 == 1, "Lloyd-Max mode flag must be 1"
+        assert (seed_mode & 0x7FFFFFFF) == seed, \
+            f"Seed in lower 31 bits: expected 0x{seed:08X}, " \
+            f"got 0x{seed_mode & 0x7FFFFFFF:08X}"
+
+        # Same seed, uniform mode — MSB must be 0
+        data_u = encode_batch(opinions, bits=3, seed=seed, quantizer='uniform')
+        seed_mode_u = struct.unpack('>I', data_u[:4])[0]
+        assert seed_mode_u >> 31 == 0, "Uniform mode flag must be 0"
+        assert (seed_mode_u & 0x7FFFFFFF) == seed
 
     def test_norm_in_bytes_4_5(self):
         """Bytes 4–5 contain the uint16 quantized norm."""
@@ -1416,6 +1429,136 @@ class TestBatchWireFormat:
         norm_q = struct.unpack('>H', data[4:6])[0]
         # Norm of 30 opinion values in [0,1] should be positive
         assert 0 < norm_q <= 65535
+
+
+class TestBatchWireFormatModeFlag:
+    """Wire format mode flag: seed MSB encodes quantizer mode (spec v0.4.5).
+
+    The 4-byte seed_mode field is:
+      - Bit 31 (MSB): quantizer mode m (0 = uniform, 1 = Lloyd-Max)
+      - Bits 30-0: PRNG seed s (range [0, 2^31 - 1])
+
+    This makes the wire format self-describing at zero additional byte cost.
+    """
+
+    def test_lloyd_max_sets_msb(self):
+        """Lloyd-Max mode (m=1) sets bit 31 of the seed field."""
+        import struct
+        opinions = _make_opinions(10)
+        data = encode_batch(opinions, bits=3, seed=42, quantizer='lloyd_max')
+        seed_mode = struct.unpack('>I', data[:4])[0]
+        mode = seed_mode >> 31
+        assert mode == 1, f"Expected mode=1 (Lloyd-Max), got {mode}"
+
+    def test_uniform_clears_msb(self):
+        """Uniform mode (m=0) clears bit 31 of the seed field."""
+        import struct
+        opinions = _make_opinions(10)
+        data = encode_batch(opinions, bits=3, seed=42, quantizer='uniform')
+        seed_mode = struct.unpack('>I', data[:4])[0]
+        mode = seed_mode >> 31
+        assert mode == 0, f"Expected mode=0 (uniform), got {mode}"
+
+    def test_seed_in_lower_31_bits(self):
+        """The PRNG seed is stored in bits 30-0."""
+        import struct
+        opinions = _make_opinions(10)
+        seed = 0x12345678  # bit 31 = 0, so no conflict
+        data = encode_batch(opinions, bits=3, seed=seed, quantizer='lloyd_max')
+        seed_mode = struct.unpack('>I', data[:4])[0]
+        extracted_seed = seed_mode & 0x7FFFFFFF
+        assert extracted_seed == seed, \
+            f"Expected seed 0x{seed:08X}, got 0x{extracted_seed:08X}"
+
+    def test_seed_masked_to_31_bits(self):
+        """Seeds >= 2^31 are masked to 31 bits (MSB reserved for mode)."""
+        import struct
+        opinions = _make_opinions(10)
+        seed = 0xDEADBEEF  # bit 31 = 1
+        data = encode_batch(opinions, bits=3, seed=seed, quantizer='uniform')
+        seed_mode = struct.unpack('>I', data[:4])[0]
+        mode = seed_mode >> 31
+        extracted_seed = seed_mode & 0x7FFFFFFF
+        assert mode == 0, "Mode should be 0 (uniform), not contaminated by seed MSB"
+        assert extracted_seed == (seed & 0x7FFFFFFF), \
+            f"Seed should be masked: expected 0x{seed & 0x7FFFFFFF:08X}, " \
+            f"got 0x{extracted_seed:08X}"
+
+    def test_decode_auto_detects_lloyd_max(self):
+        """decode_batch with quantizer=None auto-detects Lloyd-Max from wire."""
+        opinions = _make_opinions(20)
+        data = encode_batch(opinions, bits=3, seed=42, quantizer='lloyd_max')
+        decoded = decode_batch(data, 20, bits=3, quantizer=None)
+        assert len(decoded) == 20
+        # Must match explicit Lloyd-Max decode
+        decoded_explicit = decode_batch(data, 20, bits=3, quantizer='lloyd_max')
+        for d_auto, d_exp in zip(decoded, decoded_explicit):
+            for j in range(4):
+                assert d_auto[j] == d_exp[j], \
+                    f"Auto-detect mismatch: {d_auto} != {d_exp}"
+
+    def test_decode_auto_detects_uniform(self):
+        """decode_batch with quantizer=None auto-detects uniform from wire."""
+        opinions = _make_opinions(20)
+        data = encode_batch(opinions, bits=3, seed=42, quantizer='uniform')
+        decoded = decode_batch(data, 20, bits=3, quantizer=None)
+        assert len(decoded) == 20
+        decoded_explicit = decode_batch(data, 20, bits=3, quantizer='uniform')
+        for d_auto, d_exp in zip(decoded, decoded_explicit):
+            for j in range(4):
+                assert d_auto[j] == d_exp[j], \
+                    f"Auto-detect mismatch: {d_auto} != {d_exp}"
+
+    def test_decode_mismatch_raises(self):
+        """decode_batch raises if explicit quantizer contradicts wire mode."""
+        opinions = _make_opinions(10)
+        data = encode_batch(opinions, bits=3, seed=42, quantizer='lloyd_max')
+        with pytest.raises(ValueError, match="[Qq]uantizer.*mode|[Mm]ode.*mismatch"):
+            decode_batch(data, 10, bits=3, quantizer='uniform')
+
+    def test_wire_size_unchanged_both_modes(self):
+        """Mode flag steals from seed - wire size stays 6 + ceil(D*b/8)."""
+        for quantizer in ('lloyd_max', 'uniform'):
+            opinions = _make_opinions(20)
+            data = encode_batch(opinions, bits=3, seed=42, quantizer=quantizer)
+            d = _next_pow2(60)
+            expected = 6 + math.ceil(d * 3 / 8)
+            assert len(data) == expected, \
+                f"q={quantizer}: got {len(data)}, expected {expected}"
+
+    def test_round_trip_both_modes_auto_detect(self):
+        """Both modes round-trip correctly with auto-detect decode."""
+        opinions = _make_opinions(32)
+        for quantizer in ('lloyd_max', 'uniform'):
+            data = encode_batch(opinions, bits=4, seed=99, quantizer=quantizer)
+            decoded = decode_batch(data, 32, bits=4)  # auto-detect (quantizer=None)
+            for orig, dec in zip(opinions, decoded):
+                for j in range(4):
+                    assert abs(orig[j] - dec[j]) < 0.5, \
+                        f"q={quantizer}: large error {abs(orig[j]-dec[j]):.4f}"
+
+    def test_rht_uses_masked_seed_not_full_field(self):
+        """The RHT must use the 31-bit seed, not the full seed_mode field.
+
+        Encodes the same opinions with the same 31-bit seed but different modes.
+        The RHT output differs (different quantizer), but the RHT permutation
+        and signs must be identical (same seed). We verify by checking that
+        the seed extracted from the wire is consistent.
+        """
+        import struct
+        opinions = _make_opinions(10)
+        seed = 42
+        data_lm = encode_batch(opinions, bits=3, seed=seed, quantizer='lloyd_max')
+        data_u = encode_batch(opinions, bits=3, seed=seed, quantizer='uniform')
+
+        sm_lm = struct.unpack('>I', data_lm[:4])[0]
+        sm_u = struct.unpack('>I', data_u[:4])[0]
+
+        # Same 31-bit seed
+        assert (sm_lm & 0x7FFFFFFF) == (sm_u & 0x7FFFFFFF) == seed
+        # Different MSB (mode flag)
+        assert (sm_lm >> 31) == 1  # Lloyd-Max
+        assert (sm_u >> 31) == 0   # uniform
 
 
 class TestBatchRoundtrip:
