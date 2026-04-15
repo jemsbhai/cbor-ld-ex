@@ -802,7 +802,9 @@ def encode_batch(
         opinions: List of N opinions, each (b, d, u, a) with b+d+u=1.
         bits: Quantization bit-width per coordinate (2\u20138).
         seed: PRNG seed (31-bit, range [0, 2^31-1]), or None for random.
-        quantizer: 'lloyd_max' (default) or 'uniform'.
+        quantizer: None (default) to auto-detect from wire mode flag,
+            or 'lloyd_max'/'uniform' to validate against wire mode.
+            Raises ValueError if explicit quantizer contradicts wire.
 
     Returns:
         Wire bytes of length 6 + ceil(D \u00d7 bits / 8).
@@ -881,7 +883,7 @@ def decode_batch(
     """Decode a batch of SL opinions from wire format.
 
     Pipeline (inverse of encode_batch):
-      1. Unpack seed, norm_q, quantized coordinates
+      1. Unpack seed_mode (extract mode flag + 31-bit seed), norm_q, quantized coordinates
       2. Dequantize each coordinate
       3. Denormalize: w_j = (x_j - 0.5) \u00d7 norm \u00d7 C
       4. Inverse RHT: v_padded = P\u207b\u00b9(\u03c3 \u2299 H_D \u00b7 w)

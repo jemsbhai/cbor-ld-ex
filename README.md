@@ -20,7 +20,7 @@ Built on [jsonld-ex](https://pypi.org/project/jsonld-ex/) and its compliance alg
 - **Security primitives** — annotation digests, Byzantine fusion metadata, chained provenance (16 bytes per entry, zero waste)
 - **Transport-agnostic** — identical payloads over MQTT and CoAP
 - **Three formal axioms** — backward compatibility, algebraic closure, quantization correctness
-- **282 tests** including exhaustive 8-bit verification (32,896 pairs) and Hypothesis property tests
+- **820 tests** including exhaustive 8-bit verification (32,896 pairs), Hypothesis property tests, and batch compression verification
 
 ## 6-Way Encoding Benchmark
 
@@ -160,6 +160,32 @@ entry_bytes = encode_provenance_entry(entry)
 assert len(entry_bytes) == 16  # Every bit carries information
 ```
 
+### Batch Compression (§4.8)
+
+```python
+from cbor_ld_ex.batch import encode_batch, decode_batch
+
+# 32 opinions from edge sensors
+opinions = [
+    (0.7, 0.1, 0.2, 0.5),  # (belief, disbelief, uncertainty, base_rate)
+    (0.3, 0.4, 0.3, 0.5),
+    # ... 30 more opinions
+] * 16  # 32 total
+
+# Encode: RHT + Lloyd-Max quantization at 3 bits/coordinate
+wire = encode_batch(opinions, bits=3, quantizer='lloyd_max')
+# Wire format: seed_mode(4) + norm_q(2) + packed_coords
+# MSB of seed_mode = 1 (Lloyd-Max mode flag, self-describing)
+
+# Decode: auto-detects quantizer mode from wire
+recovered = decode_batch(wire, n_opinions=32, bits=3)
+# Each opinion satisfies b+d+u=1 exactly (simplex projection)
+# and a ∈ [0,1] (base rate clamping)
+
+# ~50% smaller than individual 8-bit encoding for N=32
+print(f"Wire: {len(wire)} bytes vs individual: {32*3} bytes")
+```
+
 ## Architecture
 
 ```
@@ -200,6 +226,7 @@ All three axioms are verified by cross-cutting property tests including exhausti
 | `temporal.py` | Bit-packed decay, log-scale half-life, expiry/review triggers |
 | `security.py` | Annotation digests, Byzantine metadata, provenance chains |
 | `codec.py` | Full encode/decode pipeline, `ContextRegistry`, Shannon bit analysis |
+| `batch.py` | Batch compression — RHT + Lloyd-Max quantization (§4.8) |
 | `transport.py` | MQTT + CoAP adapters, 6-way `full_benchmark()` engine |
 
 ## Development
@@ -226,6 +253,7 @@ cborldex/
 │   ├── temporal.py       # Temporal extensions — decay, triggers, BitWriter/BitReader
 │   ├── security.py       # Digests, Byzantine metadata, provenance chains
 │   ├── codec.py          # Full codec, ContextRegistry, bit-level analysis
+│   ├── batch.py          # Batch compression — RHT, Lloyd-Max, Shannon analysis
 │   └── transport.py      # MQTT + CoAP adapters, 6-way benchmark engine
 ├── tests/
 │   ├── test_opinions.py      # 38 tests — quantization, Hypothesis properties
@@ -235,15 +263,16 @@ cborldex/
 │   ├── test_security.py      # 33 tests — digests, Byzantine, provenance chains
 │   ├── test_codec.py         # 46 tests — full pipeline, payload comparison
 │   ├── test_axioms.py        # 19 tests — cross-cutting axiom verification
+│   ├── test_batch.py         # 253 tests — RHT, Lloyd-Max, batch pipeline, Shannon
 │   └── test_transport.py     # 24 tests — MQTT, CoAP, 6-way benchmark
 ├── spec/
-│   ├── FORMAL_MODEL.md       # Formal specification v0.2.0-draft
+│   ├── FORMAL_MODEL.md       # Formal specification v0.4.5-draft
 │   └── IMPLEMENTATION_PLAN.md
 ├── pyproject.toml
 └── LICENSE
 ```
 
-**282 tests total**, all passing.
+**820 tests total**, all passing.
 
 ## References
 
@@ -255,6 +284,13 @@ cborldex/
 - Selander, G. et al. (2019). [RFC 8613: OSCORE.](https://www.rfc-editor.org/rfc/rfc8613) IETF.
 - [CBOR-LD Specification](https://json-ld.github.io/cbor-ld-spec/) (W3C Community Group Draft).
 - [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) (W3C Recommendation).
+
+- Han, S. et al. (2025). [TurboQuant: Online Vector Quantization.](https://arxiv.org/abs/2504.19874) ICLR 2026.
+- Han, S. et al. (2025). [PolarQuant: Polar Coordinate Quantization.](https://arxiv.org/abs/2502.02617) AISTATS 2026.
+- Lloyd, S. (1982). Least squares quantization in PCM. *IEEE Trans. Information Theory.*
+- Max, J. (1960). Quantizing for minimum distortion. *IEEE Trans. Information Theory.*
+- Ailon, N. and Chazelle, B. (2009). The fast Johnson-Lindenstrauss transform. *SIAM J. Computing.*
+- Duchi, J. et al. (2008). Efficient projections onto the l1-ball. *ICML 2008.*
 
 ## License
 
