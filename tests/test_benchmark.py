@@ -67,6 +67,14 @@ from cbor_ld_ex_benchmark import (
     # Provenance analysis (§4.7.5)
     build_provenance_configs,
     run_provenance_analysis,
+    # Batch compression analysis (§4.8)
+    BatchConfig,
+    build_batch_configs,
+    run_batch_compression_analysis,
+    run_batch_distortion_analysis,
+    run_batch_ablation_analysis,
+    run_batch_constraint_analysis,
+    run_batch_rd_curve,
 )
 
 # Dependencies from existing codebase
@@ -1214,3 +1222,475 @@ class TestProvenanceScientificInvariants:
                     assert result["bit_efficiency"] > 0.96, \
                         f"FALSIFIED: {label}: L≥3 block efficiency " \
                         f"{result['bit_efficiency']:.4f} <= 0.96"
+
+
+
+# =====================================================================
+# Batch Compression Benchmark Tests — §4.8 (spec v0.4.5)
+#
+# Scientific invariants that must hold for any paper claim.
+# Every assertion is a falsifiable claim — if it fails,
+# the paper number is wrong.
+# =====================================================================
+
+# ---- Cached fixtures ----
+
+_batch_configs_cache = None
+_batch_compression_cache = None
+_batch_distortion_cache = None
+_batch_ablation_cache = None
+_batch_constraint_cache = None
+_batch_rd_cache = None
+
+
+def _get_batch_configs():
+    global _batch_configs_cache
+    if _batch_configs_cache is None:
+        _batch_configs_cache = build_batch_configs()
+    return _batch_configs_cache
+
+
+def _get_batch_compression():
+    global _batch_compression_cache
+    if _batch_compression_cache is None:
+        _batch_compression_cache = run_batch_compression_analysis(
+            _get_batch_configs()
+        )
+    return _batch_compression_cache
+
+
+def _get_batch_distortion():
+    global _batch_distortion_cache
+    if _batch_distortion_cache is None:
+        # Use 50 trials for test speed; paper uses 100
+        _batch_distortion_cache = run_batch_distortion_analysis(
+            _get_batch_configs(), n_trials=50,
+        )
+    return _batch_distortion_cache
+
+
+def _get_batch_ablation():
+    global _batch_ablation_cache
+    if _batch_ablation_cache is None:
+        _batch_ablation_cache = run_batch_ablation_analysis(
+            n_opinions_list=[20, 32, 50],
+            bits_list=[3, 4],
+            n_trials=50,
+        )
+    return _batch_ablation_cache
+
+
+def _get_batch_constraint():
+    global _batch_constraint_cache
+    if _batch_constraint_cache is None:
+        _batch_constraint_cache = run_batch_constraint_analysis(
+            n_opinions_list=[20, 32, 50],
+            bits_list=[3, 4],
+            n_trials=50,
+        )
+    return _batch_constraint_cache
+
+
+def _get_batch_rd():
+    global _batch_rd_cache
+    if _batch_rd_cache is None:
+        _batch_rd_cache = run_batch_rd_curve(
+            bits_range=[2, 3, 4, 5],
+            n_opinions=32,
+            n_trials=50,
+        )
+    return _batch_rd_cache
+
+
+class TestBatchConfigs:
+    """Batch benchmark configuration matrix completeness."""
+
+    def test_returns_48_configs(self):
+        configs = _get_batch_configs()
+        assert len(configs) == 48, f"Expected 48 configs, got {len(configs)}"
+
+    def test_unique_labels(self):
+        configs = _get_batch_configs()
+        labels = [c.label for c in configs]
+        assert len(labels) == len(set(labels)), "Duplicate labels"
+
+    def test_covers_all_batch_sizes(self):
+        configs = _get_batch_configs()
+        ns = {c.n_opinions for c in configs}
+        assert ns == {8, 10, 20, 32, 50, 100}
+
+    def test_covers_all_bit_widths(self):
+        configs = _get_batch_configs()
+        bs = {c.bits for c in configs}
+        assert bs == {2, 3, 4, 5}
+
+    def test_covers_both_quantizers(self):
+        configs = _get_batch_configs()
+        qs = {c.quantizer for c in configs}
+        assert qs == {'uniform', 'lloyd_max'}
+
+
+class TestBatchCompressionInvariants:
+    """Scientific invariants for batch compression claims."""
+
+    def test_wire_size_matches_formula(self):
+        """Wire bytes = 6 + ceil(D × b / 8), no exceptions."""
+        for label, r in _get_batch_compression():
+            n, b = r['n_opinions'], r['bits']
+            d = 1
+            while d < 3 * n:
+                d *= 2
+            expected = 6 + math.ceil(d * b / 8)
+            assert r['wire_bytes'] == expected, \
+                f"FALSIFIED {label}: wire={r['wire_bytes']}, expected={expected}"
+
+    def test_batch_saves_space_when_formula_predicts(self):
+        """Batch encoding < individual encoding when 6+ceil(D*b/8) < 3N.
+
+        Not all (N, b) pairs save space. At small N with high b,
+        the 6-byte header + padding waste can exceed 3N.
+        This test verifies savings exactly where the spec predicts.
+        """
+        for label, r in _get_batch_compression():
+            n, b = r['n_opinions'], r['bits']
+            d = 1
+            while d < 3 * n:
+                d *= 2
+            formula_predicts_savings = (6 + math.ceil(d * b / 8)) < 3 * n
+            if formula_predicts_savings:
+                assert r['wire_bytes'] < r['individual_bytes'], \
+                    f"FALSIFIED {label}: formula predicts savings but " \
+                    f"batch {r['wire_bytes']} >= individual {r['individual_bytes']}"
+
+    def test_compression_ratio_bounded_0_to_1_for_useful_configs(self):
+        """Compression ratio in (0, 1) when batch is smaller."""
+        for label, r in _get_batch_compression():
+            if r['wire_bytes'] < r['individual_bytes']:
+                assert 0 < r['compression_ratio'] < 1.0, \
+                    f"FALSIFIED {label}: ratio={r['compression_ratio']}"
+
+    def test_efficiency_bounded_0_to_1(self):
+        """Shannon efficiency in (0, 1] for all configs."""
+        for label, r in _get_batch_compression():
+            assert 0 < r['efficiency'] <= 1.0, \
+                f"FALSIFIED {label}: efficiency={r['efficiency']}"
+
+    def test_information_bits_leq_wire_bits(self):
+        """Information content never exceeds wire capacity."""
+        for label, r in _get_batch_compression():
+            assert r['information_bits'] <= r['wire_bits'], \
+                f"FALSIFIED {label}: info={r['information_bits']} > " \
+                f"wire={r['wire_bits']}"
+
+    def test_overhead_decomposition_exact(self):
+        """overhead + padding_waste + information = wire_bits."""
+        for label, r in _get_batch_compression():
+            total = r['overhead_bits'] + r['padding_waste_bits'] + r['information_bits']
+            assert total == r['wire_bits'], \
+                f"FALSIFIED {label}: {r['overhead_bits']}+{r['padding_waste_bits']}" \
+                f"+{r['information_bits']} = {total} != {r['wire_bits']}"
+
+    def test_seed_and_norm_account_for_48_bits(self):
+        """Seed (32 bits) + norm (16 bits) = 48 bits of header."""
+        for label, r in _get_batch_compression():
+            assert r['seed_bits'] + r['norm_bits'] == 48
+            assert r['payload_bits'] == r['wire_bits'] - 48, \
+                f"FALSIFIED {label}: payload accounting error"
+
+
+class TestBatchDistortionInvariants:
+    """Scientific invariants for distortion claims (Theorem 15)."""
+
+    def test_mse_bound_holds_all_trials(self):
+        """Theorem 15(a): MSE <= 9||v||^2 / (N(2^b-1)^2) + norm_margin.
+
+        The bound includes the norm quantization error term.
+        The benchmark analysis already includes this margin.
+        """
+        for label, r in _get_batch_distortion():
+            assert r['bound_holds_all_trials'], \
+                f"FALSIFIED {label}: MSE exceeded theoretical bound " \
+                f"in at least one trial (mean MSE={r['mse_mean']:.6e}, " \
+                f"mean bound={r['mse_bound_mean']:.6e})"
+
+    def test_mse_positive(self):
+        """MSE > 0 for all configs (quantization always introduces error)."""
+        for label, r in _get_batch_distortion():
+            assert r['mse_mean'] > 0, \
+                f"FALSIFIED {label}: MSE = 0 (impossible with lossy quantization)"
+
+    def test_lloyd_max_mse_leq_uniform(self):
+        """Theorem 15(b): Lloyd-Max MSE <= uniform MSE for same (N, b)."""
+        distortion = _get_batch_distortion()
+        # Group by (n, bits) pairs
+        grouped = {}
+        for label, r in distortion:
+            key = (r['n_opinions'], r['bits'])
+            if key not in grouped:
+                grouped[key] = {}
+            grouped[key][r['quantizer']] = r['mse_mean']
+
+        for key, qs in grouped.items():
+            if 'lloyd_max' in qs and 'uniform' in qs:
+                assert qs['lloyd_max'] <= qs['uniform'] * (1.0 + 1e-6), \
+                    f"FALSIFIED N={key[0]},b={key[1]}: " \
+                    f"LM MSE {qs['lloyd_max']:.6e} > " \
+                    f"uniform MSE {qs['uniform']:.6e}"
+
+    def test_mse_decreases_with_more_bits(self):
+        """More bits => lower MSE (monotonic for fixed N, quantizer)."""
+        distortion = _get_batch_distortion()
+        grouped = {}
+        for label, r in distortion:
+            key = (r['n_opinions'], r['quantizer'])
+            if key not in grouped:
+                grouped[key] = {}
+            grouped[key][r['bits']] = r['mse_mean']
+
+        for key, bit_mse in grouped.items():
+            bits_sorted = sorted(bit_mse.keys())
+            for i in range(len(bits_sorted) - 1):
+                b_lo, b_hi = bits_sorted[i], bits_sorted[i+1]
+                assert bit_mse[b_lo] > bit_mse[b_hi], \
+                    f"FALSIFIED N={key[0]},q={key[1]}: " \
+                    f"MSE(b={b_lo})={bit_mse[b_lo]:.6e} <= " \
+                    f"MSE(b={b_hi})={bit_mse[b_hi]:.6e}"
+
+    def test_per_component_mse_sums_to_total(self):
+        """mse_b + mse_d + mse_a ≈ mse_total."""
+        for label, r in _get_batch_distortion():
+            component_sum = r['mse_b_mean'] + r['mse_d_mean'] + r['mse_a_mean']
+            assert abs(component_sum - r['mse_mean']) < 1e-12, \
+                f"FALSIFIED {label}: component sum {component_sum:.6e} != " \
+                f"total {r['mse_mean']:.6e}"
+
+    def test_no_component_dominates_systematically(self):
+        """No single component contributes > 60% of total MSE.
+
+        If one component systematically dominates, it suggests a bias
+        in the RHT or quantization that should be investigated.
+        """
+        for label, r in _get_batch_distortion():
+            total = r['mse_mean']
+            if total < 1e-15:
+                continue
+            for comp_name, comp_key in [('b', 'mse_b_mean'),
+                                        ('d', 'mse_d_mean'),
+                                        ('a', 'mse_a_mean')]:
+                frac = r[comp_key] / total
+                assert frac < 0.60, \
+                    f"FALSIFIED {label}: component '{comp_name}' " \
+                    f"contributes {frac:.1%} of total MSE"
+
+    def test_rho_within_expected_range(self):
+        """Lloyd-Max ρ in [1.0, πe/3] for all bit-widths."""
+        pi_e_3 = math.pi * math.e / 3.0
+        for label, r in _get_batch_distortion():
+            if r['rho'] is not None:
+                assert 1.0 < r['rho'] < pi_e_3, \
+                    f"FALSIFIED {label}: rho={r['rho']:.4f} " \
+                    f"outside (1.0, {pi_e_3:.4f})"
+
+    def test_mse_std_reasonable(self):
+        """Coefficient of variation (std/mean) bounded.
+
+        CV < 1.0 for N >= 20. For small N (< 20), MSE variance
+        is dominated by the random opinion distribution, so we
+        relax to CV < 2.0. This is expected: with N=10 and b=5,
+        the per-opinion MSE is O(10^-5) and a single outlier
+        opinion batch can double it.
+        """
+        for label, r in _get_batch_distortion():
+            if r['mse_mean'] > 1e-15:
+                cv = r['mse_std'] / r['mse_mean']
+                threshold = 1.0 if r['n_opinions'] >= 20 else 2.0
+                assert cv < threshold, \
+                    f"FALSIFIED {label}: CV={cv:.2f} >= {threshold} " \
+                    f"(unstable results)"
+
+
+class TestBatchAblationInvariants:
+    """Scientific invariants for the 3-arm ablation study."""
+
+    def test_rht_lm_best_arm(self):
+        """RHT + Lloyd-Max always achieves lowest MSE (or ties)."""
+        for label, r in _get_batch_ablation():
+            assert r['rht_lm_mse_mean'] <= r['rht_uniform_mse_mean'] * (1 + 1e-6), \
+                f"FALSIFIED {label}: RHT+LM ({r['rht_lm_mse_mean']:.6e}) > " \
+                f"RHT+Uniform ({r['rht_uniform_mse_mean']:.6e})"
+
+    def test_independent_lower_mse_at_equal_bitwidth(self):
+        """Independent per-component quantization has lower MSE at equal b.
+
+        This is EXPECTED and scientifically correct: independent
+        quantization avoids RHT padding waste, norm quantization error,
+        and the error-mixing effect of the orthogonal transform.
+        The RHT approach's value is COMPRESSION (fewer wire bytes),
+        not lower MSE at equal bit-width. This test documents the
+        tradeoff for the paper's ablation table.
+
+        The independent arm quantizes each of 3 free parameters at b bits
+        on [0,1], then simplex-projects. No header, no padding, no RHT.
+        """
+        for label, r in _get_batch_ablation():
+            assert r['independent_mse_mean'] <= r['rht_lm_mse_mean'] * (1 + 0.01), \
+                f"UNEXPECTED {label}: independent ({r['independent_mse_mean']:.6e}) > " \
+                f"RHT+LM ({r['rht_lm_mse_mean']:.6e})"
+
+    def test_codebook_advantage_measurable(self):
+        """Lloyd-Max advantage over uniform is measurable (> 1% MSE reduction).
+
+        At b >= 3, the Lloyd-Max codebook should produce measurably
+        lower MSE than uniform for the same RHT pipeline.
+        """
+        for label, r in _get_batch_ablation():
+            if r['bits'] >= 3:
+                reduction = 1.0 - r['rht_lm_mse_mean'] / r['rht_uniform_mse_mean']
+                assert reduction > 0.01, \
+                    f"FALSIFIED {label}: LM advantage only {reduction:.1%} " \
+                    f"(< 1%, codebook may not be helping)"
+
+    def test_all_arms_mse_positive(self):
+        """All three arms produce positive MSE."""
+        for label, r in _get_batch_ablation():
+            for arm in ['rht_lm', 'rht_uniform', 'independent']:
+                assert r[f'{arm}_mse_mean'] > 0, \
+                    f"FALSIFIED {label}: {arm} MSE = 0"
+
+    def test_all_arms_stable(self):
+        """All arms have CV < 1.0 (results are stable)."""
+        for label, r in _get_batch_ablation():
+            for arm in ['rht_lm', 'rht_uniform', 'independent']:
+                mean = r[f'{arm}_mse_mean']
+                std = r[f'{arm}_mse_std']
+                if mean > 1e-15:
+                    cv = std / mean
+                    assert cv < 1.0, \
+                        f"FALSIFIED {label}: {arm} CV={cv:.2f}"
+
+
+class TestBatchConstraintInvariants:
+    """Scientific invariants for constraint preservation claims."""
+
+    def test_zero_simplex_violations_post_decode(self):
+        """After decode, b+d+u = 1 exactly for all opinions.
+
+        This is Axiom 3. If this fails, the simplex projection
+        in Definition 36 is broken.
+        """
+        for label, r in _get_batch_constraint():
+            assert r['simplex_violations_post_decode'] == 0, \
+                f"FALSIFIED {label}: {r['simplex_violations_post_decode']} " \
+                f"simplex violations post-decode"
+
+    def test_clipping_fraction_below_1_percent(self):
+        """< 1% of post-RHT coordinates are clipped to [0,1].
+
+        The spec claims ≈ 0.2% clipping with C=6/√D. If clipping
+        exceeds 1%, the C constant is too aggressive.
+        """
+        for label, r in _get_batch_constraint():
+            assert r['clipping_frac'] < 0.01, \
+                f"FALSIFIED {label}: clipping fraction " \
+                f"{r['clipping_frac']:.4f} >= 1%"
+
+    def test_clipping_fraction_consistent_with_spec(self):
+        """Clipping fraction ≈ 0.2% (spec claim for D >= 24).
+
+        We use a loose bound of < 0.5% to account for small-D cases.
+        """
+        for label, r in _get_batch_constraint():
+            assert r['clipping_frac'] < 0.005, \
+                f"FALSIFIED {label}: clipping fraction " \
+                f"{r['clipping_frac']:.4f} >= 0.5% (spec claims ~0.2%)"
+
+    def test_max_clip_amount_bounded(self):
+        """Maximum clipping distance < 0.5 (coordinates don't fly far)."""
+        for label, r in _get_batch_constraint():
+            if r['clipped_coords'] > 0:
+                assert r['max_clip_amount'] < 0.5, \
+                    f"FALSIFIED {label}: max clip {r['max_clip_amount']:.4f} >= 0.5"
+
+
+class TestBatchRDCurveInvariants:
+    """Scientific invariants for the rate-distortion curve."""
+
+    def test_rho_lloyd_max_below_pi_e_3(self):
+        """Lloyd-Max ρ < πe/3 ≈ 2.84 for all bit-widths.
+
+        This is the full-Gaussian asymptote. Our truncated source
+        should always be below this.
+        """
+        pi_e_3 = math.pi * math.e / 3.0
+        for label, r in _get_batch_rd():
+            assert r['rho_lloyd_max'] < pi_e_3, \
+                f"FALSIFIED {label}: rho_LM={r['rho_lloyd_max']:.4f} " \
+                f">= pi*e/3={pi_e_3:.4f}"
+
+    def test_rho_lloyd_max_above_1(self):
+        """ρ > 1.0 (information-theoretic necessity)."""
+        for label, r in _get_batch_rd():
+            assert r['rho_lloyd_max'] > 1.0, \
+                f"FALSIFIED {label}: rho_LM={r['rho_lloyd_max']:.4f} <= 1.0"
+
+    def test_rho_uniform_exceeds_lloyd_max(self):
+        """Uniform ρ > Lloyd-Max ρ for all bit-widths."""
+        for label, r in _get_batch_rd():
+            assert r['rho_uniform'] > r['rho_lloyd_max'], \
+                f"FALSIFIED {label}: rho_uniform={r['rho_uniform']:.4f} " \
+                f"<= rho_LM={r['rho_lloyd_max']:.4f}"
+
+    def test_end_to_end_mse_decreases_with_bits(self):
+        """MSE monotonically decreases with more bits (both quantizers)."""
+        rd = _get_batch_rd()
+        bits = sorted(r['bits'] for _, r in rd)
+        for q in ['lloyd_max', 'uniform']:
+            mse_key = f'mse_{q}_mean'
+            prev_mse = None
+            for b in bits:
+                mse = next(r[mse_key] for _, r in rd if r['bits'] == b)
+                if prev_mse is not None:
+                    assert mse < prev_mse, \
+                        f"FALSIFIED: {q} MSE not decreasing at b={b}: " \
+                        f"{mse:.6e} >= {prev_mse:.6e}"
+                prev_mse = mse
+
+    def test_lloyd_max_mse_below_uniform(self):
+        """Lloyd-Max end-to-end MSE < uniform for all bit-widths."""
+        for label, r in _get_batch_rd():
+            assert r['mse_lloyd_max_mean'] < r['mse_uniform_mean'], \
+                f"FALSIFIED {label}: LM MSE {r['mse_lloyd_max_mean']:.6e} " \
+                f">= uniform {r['mse_uniform_mean']:.6e}"
+
+    def test_rho_increases_with_bits(self):
+        """ρ increases with b (approaching asymptote).
+
+        This is the well-known property of scalar quantizers:
+        at low b, the quantizer adapts well to the source;
+        at high b, it converges to the Gaussian asymptote.
+        """
+        rd = _get_batch_rd()
+        bits = sorted(r['bits'] for _, r in rd)
+        prev_rho = None
+        for b in bits:
+            rho = next(r['rho_lloyd_max'] for _, r in rd if r['bits'] == b)
+            if prev_rho is not None:
+                assert rho >= prev_rho * 0.95, \
+                    f"FALSIFIED: rho decreased significantly at b={b}: " \
+                    f"{rho:.4f} < {prev_rho:.4f} * 0.95"
+            prev_rho = rho
+
+    def test_shannon_bound_below_all_achieved_mse(self):
+        """D_G(b) < achieved codebook MSE for both quantizers.
+
+        The Shannon R-D function is a lower bound; no real quantizer
+        can beat it.
+        """
+        for label, r in _get_batch_rd():
+            d_g = r['d_g_shannon']
+            assert r['eps_q_lloyd_max'] > d_g, \
+                f"FALSIFIED {label}: LM eps_q {r['eps_q_lloyd_max']:.6e} " \
+                f"<= Shannon {d_g:.6e}"
+            assert r['eps_q_uniform'] > d_g, \
+                f"FALSIFIED {label}: uniform eps_q {r['eps_q_uniform']:.6e} " \
+                f"<= Shannon {d_g:.6e}"
