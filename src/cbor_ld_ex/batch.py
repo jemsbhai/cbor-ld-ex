@@ -717,6 +717,46 @@ def _f32(x: float) -> float:
     return _struct.unpack('>f', _struct.pack('>f', x))[0]
 
 
+# Protocol-critical C = 6.0f / sqrtf(D) values, pinned to Rust reference.
+#
+# The spec mandates pure f32 arithmetic: C = 6.0f / sqrtf((float)(D)).
+# Python's `_f32(6.0 / math.sqrt(D))` computes in f64 then rounds to f32,
+# which diverges by 1 ULP at D=32, 128, 512, 2048 due to double rounding.
+# This lookup table eliminates all platform-dependent arithmetic.
+#
+# Values computed via: `6.0f32 / (D as f32).sqrt()` in Rust 1.x.
+# Verified against rustc output (IEEE 754 binary32, correctly rounded).
+_C_LOOKUP: dict[int, float] = {
+    d: _struct.unpack('>f', _struct.pack('>I', bits))[0]
+    for d, bits in [
+        (8,    0x4007c3b7),
+        (16,   0x3fc00000),
+        (32,   0x3f87c3b7),
+        (64,   0x3f400000),
+        (128,  0x3f07c3b7),
+        (256,  0x3ec00000),
+        (512,  0x3e87c3b7),
+        (1024, 0x3e400000),
+        (2048, 0x3e07c3b7),
+        (4096, 0x3dc00000),
+    ]
+}
+
+
+def _get_c_const(d: int) -> float:
+    """Get the concentration constant C = 6.0f / sqrtf(D) for padded dimension D.
+
+    Uses a lookup table of Rust-canonical float32 values to ensure
+    bit-exact cross-platform determinism (§4.8.4). Falls back to
+    _f32 computation for D values not in the table (D > 4096).
+    """
+    c = _C_LOOKUP.get(d)
+    if c is not None:
+        return c
+    # Fallback for very large D (N > ~1365 opinions)
+    return _f32(6.0 / _math.sqrt(float(d)))
+
+
 def _next_power_of_2(n: int) -> int:
     """Smallest power of 2 >= n."""
     p = 1
@@ -839,7 +879,7 @@ def encode_batch(
     w = rht_forward(v_padded, seed)
 
     # Step 4: Normalize to [0, 1]
-    c_const = _f32(6.0 / _math.sqrt(float(d)))  # IEEE 754 float32
+    c_const = _get_c_const(d)  # Rust-canonical float32 lookup
 
     if norm < 1e-30:
         # Degenerate case: all-zero input
@@ -937,7 +977,7 @@ def decode_batch(
     norm = float(norm_q) / 65535.0 * norm_max
 
     # Denormalize
-    c_const = _f32(6.0 / _math.sqrt(float(d)))
+    c_const = _get_c_const(d)  # Rust-canonical float32 lookup
 
     if norm < 1e-30:
         w = [0.0] * d

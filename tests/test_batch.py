@@ -42,6 +42,78 @@ from cbor_ld_ex.batch import (
 
 
 # =========================================================================
+# IEEE 754 float32 determinism — protocol-critical values (spec v0.4.5)
+#
+# The spec mandates C = 6.0f / sqrtf((float)(D)) in pure f32 arithmetic.
+# These values are pinned against a Rust reference implementation to
+# ensure cross-platform determinism. Any deviation means encoder and
+# decoder disagree, breaking the protocol.
+# =========================================================================
+
+
+class TestFloat32Determinism:
+    """Pin protocol-critical float32 values against Rust reference.
+
+    Computed via: rustc f32_canonical.rs && ./f32_canonical
+    using `6.0f32 / (D as f32).sqrt()` — the spec-mandated path.
+    """
+
+    # Rust-canonical C values: C = 6.0f32 / (D as f32).sqrt()
+    # Key: D (always 2^k), Value: (expected_float, expected_hex_bits)
+    CANONICAL_C = {
+        8:    (2.1213204861e+00, 0x4007c3b7),
+        16:   (1.5000000000e+00, 0x3fc00000),
+        32:   (1.0606602430e+00, 0x3f87c3b7),
+        64:   (7.5000000000e-01, 0x3f400000),
+        128:  (5.3033012152e-01, 0x3f07c3b7),
+        256:  (3.7500000000e-01, 0x3ec00000),
+        512:  (2.6516506076e-01, 0x3e87c3b7),
+        1024: (1.8750000000e-01, 0x3e400000),
+        2048: (1.3258253038e-01, 0x3e07c3b7),
+        4096: (9.3750000000e-02, 0x3dc00000),
+    }
+
+    @pytest.mark.parametrize("d,expected_hex", [
+        (d, v[1]) for d, v in sorted(CANONICAL_C.items())
+    ])
+    def test_c_matches_rust_canonical(self, d, expected_hex):
+        """C = 6.0f / sqrtf(D) matches Rust reference to the bit."""
+        import struct
+        from cbor_ld_ex.batch import _get_c_const
+        c = _get_c_const(d)
+        actual_hex = struct.unpack('>I', struct.pack('>f', c))[0]
+        assert actual_hex == expected_hex, (
+            f"D={d}: Python C=0x{actual_hex:08x}, "
+            f"Rust canonical=0x{expected_hex:08x} "
+            f"(off by {abs(actual_hex - expected_hex)} ULP)"
+        )
+
+    # Rust-canonical norm_max values: (3*N as f32).sqrt()
+    CANONICAL_NORM_MAX = {
+        8:   0x409cc471,
+        10:  0x40af456f,
+        20:  0x40f7def6,
+        32:  0x411cc471,
+        50:  0x4143f58d,
+        100: 0x418a9067,
+    }
+
+    @pytest.mark.parametrize("n,expected_hex", [
+        (n, h) for n, h in sorted(CANONICAL_NORM_MAX.items())
+    ])
+    def test_norm_max_matches_rust_canonical(self, n, expected_hex):
+        """norm_max = sqrtf(3*N) matches Rust reference to the bit."""
+        import struct
+        from cbor_ld_ex.batch import _f32
+        nm = _f32(math.sqrt(float(3 * n)))
+        actual_hex = struct.unpack('>I', struct.pack('>f', nm))[0]
+        assert actual_hex == expected_hex, (
+            f"N={n}: Python norm_max=0x{actual_hex:08x}, "
+            f"Rust canonical=0x{expected_hex:08x}"
+        )
+
+
+# =========================================================================
 # SplitMix64 seeder — canonical test vectors
 # =========================================================================
 
