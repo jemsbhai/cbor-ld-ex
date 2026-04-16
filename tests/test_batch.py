@@ -2246,3 +2246,196 @@ class TestBatchShannonAnalysis:
         batch_bytes = 6 + math.ceil(d * bits / 8)
         assert batch_bytes < individual_bytes, \
             f"N={n_opinions}: batch {batch_bytes} >= individual {individual_bytes}"
+
+
+# =========================================================================
+# Bit-width range validation — protocol conformance (spec v0.4.6)
+#
+# The CBOR-LD-ex batch compression protocol restricts the per-coordinate
+# quantization bit-width to b ∈ {2, 3, 4, 5, 6, 7, 8}.
+#
+# Rationale:
+#   - b = 1 (sign-only) is not a rate-distortion regime; Lloyd-Max reduces
+#     to a two-centroid sign quantizer, falling outside Theorem 15's
+#     distortion-rate analysis. PolarQuant's analytical bound also
+#     requires b ≥ 2.
+#   - b ≥ 9 offers diminishing returns: at b = 8 the quantization error
+#     is already two orders of magnitude below the pipeline's norm
+#     quantization floor (~1/131070 from norm_q). Additional bits burn
+#     wire bytes without meaningful MSE reduction.
+#   - The §4.8 reference ρ values are only measured for b ∈ {2, 3, 4, 5};
+#     the spec extends the permissible range to b = 8 for paper
+#     rate-distortion sweeps and potential high-precision use cases.
+#
+# This is enforced at runtime in three public entry points:
+#   encode_batch, decode_batch, lloyd_max_codebook.
+#
+# Validation rules:
+#   - Type: bits must be int (not bool, not float, not str, not None)
+#   - Value: 2 ≤ bits ≤ 8 inclusive
+#   - Exception: ValueError for all violations (matches batch.py convention)
+# =========================================================================
+
+
+class TestBitWidthRangeValidation:
+    """Runtime enforcement of b ∈ {2..8} at encode/decode/codebook boundaries.
+
+    The protocol restricts bit-width to the closed range [2, 8]. All three
+    public entry points must reject violations with ValueError at call time
+    (not silently produce invalid output).
+    """
+
+    # Values outside the valid range [2, 8]
+    _INVALID_VALUES = [-1, 0, 1, 9, 16, 100]
+
+    # Values at the boundaries of the valid range
+    _VALID_BOUNDARY_VALUES = [2, 8]
+
+    # Non-integer types that must be rejected
+    _INVALID_TYPES = [2.5, 3.0, "3", None, True, False]
+
+    # --- encode_batch validation ---
+
+    @pytest.mark.parametrize("bits", _INVALID_VALUES)
+    def test_encode_batch_rejects_bit_width_range(self, bits):
+        """encode_batch raises ValueError for bits outside [2, 8]."""
+        opinions = _make_opinions(10)
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            encode_batch(opinions, bits=bits, seed=42)
+
+    @pytest.mark.parametrize("bits", _INVALID_TYPES)
+    def test_encode_batch_rejects_bit_width_type(self, bits):
+        """encode_batch raises ValueError for non-int bits.
+
+        bool is a subclass of int in Python (True == 1, False == 0), but
+        using a boolean as a bit-width is almost certainly a bug, so it
+        is explicitly rejected. Floats with integer value (e.g. 3.0) are
+        also rejected — callers must pass int explicitly.
+        """
+        opinions = _make_opinions(10)
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            encode_batch(opinions, bits=bits, seed=42)
+
+    def test_encode_batch_error_mentions_valid_range(self):
+        """Error message cites the valid range for diagnostic clarity.
+
+        A good error message tells the caller what IS allowed, not just
+        what went wrong. This test pins that behaviour.
+        """
+        opinions = _make_opinions(10)
+        with pytest.raises(ValueError) as exc_info:
+            encode_batch(opinions, bits=1, seed=42)
+        msg = str(exc_info.value)
+        # Must reference the valid range 2..8 in some readable form
+        assert "2" in msg and "8" in msg, \
+            f"Error message should cite the range [2, 8]: got {msg!r}"
+
+    # --- decode_batch validation ---
+
+    @pytest.mark.parametrize("bits", _INVALID_VALUES)
+    def test_decode_batch_rejects_bit_width_range(self, bits):
+        """decode_batch raises ValueError for bits outside [2, 8].
+
+        Use a stub wire payload long enough not to trigger an
+        index error before the bits check — the validation must happen
+        BEFORE any byte slicing of the wire.
+        """
+        # 6-byte header + plenty of payload for any plausible (D, b)
+        dummy_wire = b"\x00" * 256
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            decode_batch(dummy_wire, n_opinions=10, bits=bits)
+
+    @pytest.mark.parametrize("bits", _INVALID_TYPES)
+    def test_decode_batch_rejects_bit_width_type(self, bits):
+        """decode_batch raises ValueError for non-int bits."""
+        dummy_wire = b"\x00" * 256
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            decode_batch(dummy_wire, n_opinions=10, bits=bits)
+
+    # --- lloyd_max_codebook validation ---
+
+    @pytest.mark.parametrize("bits", _INVALID_VALUES)
+    def test_lloyd_max_codebook_rejects_bit_width_range(self, bits):
+        """lloyd_max_codebook raises ValueError for bits outside [2, 8].
+
+        The docstring already claims "2-8"; this test makes it enforced.
+        """
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            lloyd_max_codebook(bits)
+
+    @pytest.mark.parametrize("bits", _INVALID_TYPES)
+    def test_lloyd_max_codebook_rejects_bit_width_type(self, bits):
+        """lloyd_max_codebook raises ValueError for non-int bits."""
+        with pytest.raises(ValueError, match=r"[Bb]its"):
+            lloyd_max_codebook(bits)
+
+    # --- Boundary values must still work ---
+
+    @pytest.mark.parametrize("bits", _VALID_BOUNDARY_VALUES)
+    def test_encode_batch_accepts_boundary_bits(self, bits):
+        """Both b=2 and b=8 are valid and encode without raising."""
+        opinions = _make_opinions(10)
+        # Must not raise for either quantizer
+        data_u = encode_batch(opinions, bits=bits, seed=42, quantizer='uniform')
+        assert len(data_u) > 0
+        # Lloyd-Max at the boundary is tested in a dedicated round-trip
+        # test below — we only assert non-empty output here.
+
+    @pytest.mark.parametrize("bits", _VALID_BOUNDARY_VALUES)
+    def test_lloyd_max_codebook_accepts_boundary_bits(self, bits):
+        """Both b=2 and b=8 return a well-formed codebook."""
+        boundaries, centroids = lloyd_max_codebook(bits)
+        assert len(centroids) == 2 ** bits
+        assert len(boundaries) == 2 ** bits - 1
+
+    def test_b8_roundtrip_lloyd_max(self):
+        """End-to-end round-trip at the upper boundary b=8 with Lloyd-Max.
+
+        This is the first test to exercise the full pipeline at b=8.
+        It validates that:
+          - Lloyd-Max codebook computation converges for 256 centroids
+          - Wire packing/unpacking at 8 bits per coordinate is correct
+          - Auto-detect mode (wire MSB) works at the new boundary
+          - Total MSE obeys Theorem 15(a): 9*‖v‖²/(N*(2^8-1)²)
+            which is ~1.4×10⁻⁴ times tighter than b=3.
+
+        Guards against regressions if we ever touch the quantization
+        or packing internals in a way that breaks large bit-widths.
+        """
+        n_opinions = 20
+        bits = 8
+        opinions = _make_opinions(n_opinions)
+
+        data = encode_batch(opinions, bits=bits, seed=42, quantizer='lloyd_max')
+
+        # Wire size must match the exact formula
+        d = _next_pow2(3 * n_opinions)  # D = 64 for N=20
+        expected_size = 6 + math.ceil(d * bits / 8)  # 6 + 64 = 70
+        assert len(data) == expected_size, \
+            f"b=8: got {len(data)} bytes, expected {expected_size}"
+
+        # Auto-detect decode must recover Lloyd-Max mode
+        decoded = decode_batch(data, n_opinions, bits=bits)
+        assert len(decoded) == n_opinions
+
+        # Total MSE obeys Theorem 15(a) bound
+        v_norm_sq = sum(o[0]**2 + o[1]**2 + o[3]**2 for o in opinions)
+        k_minus_1 = 2 ** bits - 1  # = 255
+        norm_max = math.sqrt(3.0 * n_opinions)
+        norm_err = norm_max / (2 * 65535)
+        norm_margin = 36.0 * norm_err ** 2
+        bound = 9.0 * v_norm_sq / (n_opinions * k_minus_1**2) + norm_margin
+
+        actual_mse = sum(
+            (orig[0]-dec[0])**2 + (orig[1]-dec[1])**2 + (orig[3]-dec[3])**2
+            for orig, dec in zip(opinions, decoded)
+        ) / n_opinions
+
+        assert actual_mse <= bound, \
+            f"b=8 Lloyd-Max: MSE {actual_mse:.6e} > bound {bound:.6e}"
+
+        # Constraints still hold at the boundary
+        for i, (b_val, d_val, u_val, a_val) in enumerate(decoded):
+            assert abs(b_val + d_val + u_val - 1.0) < 1e-12, \
+                f"b=8 opinion {i}: b+d+u = {b_val+d_val+u_val}"
+            assert 0.0 - 1e-12 <= a_val <= 1.0 + 1e-12

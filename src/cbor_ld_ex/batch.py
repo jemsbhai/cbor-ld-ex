@@ -30,6 +30,63 @@ _U64_MASK = 0xFFFFFFFFFFFFFFFF
 
 
 # =========================================================================
+# Protocol-mandated bit-width range — §4.8
+#
+# The batch compression protocol restricts per-coordinate quantization
+# bit-width to b ∈ {2, 3, 4, 5, 6, 7, 8}.
+#
+#   Lower bound (b ≥ 2): b = 1 is a sign-only regime, not a
+#   rate-distortion regime. Theorem 15's analytical MSE bound is
+#   defined for b ≥ 2, and the reference ρ values in the paper are
+#   measured for b ∈ {2, 3, 4, 5}.
+#
+#   Upper bound (b ≤ 8): at b = 8 the Lloyd-Max codebook MSE is already
+#   well below the pipeline's norm_q floor (~1/131070), so additional
+#   bits consume wire bytes without meaningful MSE reduction.
+#
+# This constraint is enforced at every public entry point of the batch
+# pipeline (encode_batch, decode_batch, lloyd_max_codebook) via
+# _validate_bits. Violations raise ValueError immediately, before any
+# wire-format processing — see TestBitWidthRangeValidation.
+# =========================================================================
+
+_MIN_BITS = 2
+_MAX_BITS = 8
+
+
+def _validate_bits(bits: object) -> None:
+    """Validate bit-width against the protocol range [2, 8].
+
+    Called at the entry of every public function that accepts a `bits`
+    parameter. Fails fast with ValueError — no silent acceptance of
+    out-of-range values.
+
+    Args:
+        bits: Value to validate. Must be an int in [2, 8].
+
+    Raises:
+        ValueError: If bits is not an int, is a bool, or is outside [2, 8].
+            The error message cites the valid range.
+    """
+    # Reject bool first: isinstance(True, int) is True in Python, but
+    # using True/False as a bit-width is almost certainly a bug.
+    if isinstance(bits, bool):
+        raise ValueError(
+            f"bits must be an int in [{_MIN_BITS}, {_MAX_BITS}], "
+            f"got bool: {bits!r}"
+        )
+    if not isinstance(bits, int):
+        raise ValueError(
+            f"bits must be an int in [{_MIN_BITS}, {_MAX_BITS}], "
+            f"got {type(bits).__name__}: {bits!r}"
+        )
+    if bits < _MIN_BITS or bits > _MAX_BITS:
+        raise ValueError(
+            f"bits must be in [{_MIN_BITS}, {_MAX_BITS}], got {bits}"
+        )
+
+
+# =========================================================================
 # SplitMix64 — seeder for xoshiro128++
 #
 # Canonical reference: https://prng.di.unimi.it/splitmix64.c
@@ -389,7 +446,8 @@ def lloyd_max_codebook(
     return the same objects without recomputation.
 
     Args:
-        bits: Number of quantization bits (2–8).
+        bits: Number of quantization bits. Must be an int in [2, 8]
+            (protocol-mandated range, enforced at runtime).
         dim: Padded dimension D for Beta-exact mode, or None for Gaussian.
         iterations: Maximum Lloyd-Max iterations (default 300).
 
@@ -399,8 +457,10 @@ def lloyd_max_codebook(
         of 2^b reconstruction levels (sorted ascending).
 
     Raises:
+        ValueError: If bits is not an int in [2, 8].
         ImportError: If scipy is not available.
     """
+    _validate_bits(bits)
     cache_key = (bits, dim)
     if cache_key in _codebook_cache:
         return _codebook_cache[cache_key]
@@ -831,27 +891,29 @@ def encode_batch(
     """Encode a batch of SL opinions into compact wire format.
 
     Pipeline (Definition 34 + 35):
-      1. Stack (b, d, a) from each opinion into v \u2208 \u211d^(3N)
-      2. Pad to D = 2^\u2308log\u2082(3N)\u2309 with zeros
-      3. RHT: w = H_D \u00b7 (\u03c3 \u2299 P(v_padded))
-      4. Normalize: x_j = w_j / (norm \u00d7 C) + 0.5, clamp to [0,1]
+      1. Stack (b, d, a) from each opinion into v ∈ ℝ^(3N)
+      2. Pad to D = 2^⌈log₂(3N)⌉ with zeros
+      3. RHT: w = H_D · (σ ⊙ P(v_padded))
+      4. Normalize: x_j = w_j / (norm × C) + 0.5, clamp to [0,1]
       5. Quantize each x_j at b bits
       6. Pack into wire format: seed_mode(4) + norm_q(2) + packed_coords
 
     Args:
         opinions: List of N opinions, each (b, d, u, a) with b+d+u=1.
-        bits: Quantization bit-width per coordinate (2\u20138).
+        bits: Quantization bit-width per coordinate. Must be an int
+            in [2, 8] (protocol-mandated range, enforced at runtime).
         seed: PRNG seed (31-bit, range [0, 2^31-1]), or None for random.
         quantizer: None (default) to auto-detect from wire mode flag,
             or 'lloyd_max'/'uniform' to validate against wire mode.
             Raises ValueError if explicit quantizer contradicts wire.
 
     Returns:
-        Wire bytes of length 6 + ceil(D \u00d7 bits / 8).
+        Wire bytes of length 6 + ceil(D × bits / 8).
 
     Raises:
-        ValueError: If opinions is empty.
+        ValueError: If bits is not an int in [2, 8], or if opinions is empty.
     """
+    _validate_bits(bits)
     if not opinions:
         raise ValueError("opinions must be non-empty")
 
@@ -925,22 +987,27 @@ def decode_batch(
     Pipeline (inverse of encode_batch):
       1. Unpack seed_mode (extract mode flag + 31-bit seed), norm_q, quantized coordinates
       2. Dequantize each coordinate
-      3. Denormalize: w_j = (x_j - 0.5) \u00d7 norm \u00d7 C
-      4. Inverse RHT: v_padded = P\u207b\u00b9(\u03c3 \u2299 H_D \u00b7 w)
+      3. Denormalize: w_j = (x_j - 0.5) × norm × C
+      4. Inverse RHT: v_padded = P⁻¹(σ ⊙ H_D · w)
       5. Unpad: take first 3N values
       6. Restore constraints (Definition 36):
-         Step A: simplex_project([b\u0303, d\u0303, 1\u2212b\u0303\u2212d\u0303])
-         Step B: clamp a\u0303 to [0, 1]
+         Step A: simplex_project([b̃, d̃, 1−b̃−d̃])
+         Step B: clamp ã to [0, 1]
 
     Args:
         data: Wire bytes from encode_batch.
         n_opinions: Number of opinions N that were encoded.
-        bits: Quantization bit-width per coordinate.
+        bits: Quantization bit-width per coordinate. Must be an int
+            in [2, 8] (protocol-mandated range, enforced at runtime).
         quantizer: 'lloyd_max' (default) or 'uniform'.
 
     Returns:
-        List of N opinions, each (b, d, u, a) with b+d+u=1, a \u2208 [0,1].
+        List of N opinions, each (b, d, u, a) with b+d+u=1, a ∈ [0,1].
+
+    Raises:
+        ValueError: If bits is not an int in [2, 8].
     """
+    _validate_bits(bits)
     # Unpack header (spec v0.4.5: seed MSB = quantizer mode flag)
     seed_mode, norm_q = _struct.unpack('>IH', data[:6])
     wire_mode = seed_mode >> 31

@@ -1,9 +1,9 @@
 # CBOR-LD-ex: Formal Data Model Specification
 
-**Version:** 0.4.5-draft  
-**Date:** 2026-04-15  
+**Version:** 0.4.6-draft  
+**Date:** 2026-04-16  
 **Authors:** Muntaser Syed  
-**Status:** Working Draft — Lloyd-Max dual-mode quantizer, wire format mode flag (v0.4.4 → v0.4.5)  
+**Status:** Working Draft — batch bit-width range normative (v0.4.5 → v0.4.6)  
 **Parent Project:** jsonld-ex (https://pypi.org/project/jsonld-ex/)  
 **Target Venue:** IETF 125 Hackathon, March 14–15 2026  
 
@@ -1083,6 +1083,26 @@ All measured ρ < πe/3 ≈ 2.84 (consistent with truncation reducing tail waste
 
 ---
 
+#### 4.8.8 Bit-Width Range (Normative)
+
+A conformant CBOR-LD-ex batch encoder MUST restrict the per-coordinate quantization bit-width `b` in Definition 35 to the closed integer range:
+
+```
+b ∈ {2, 3, 4, 5, 6, 7, 8}
+```
+
+Encoders and decoders MUST reject values outside this range with an error; they MUST NOT silently clamp, truncate, or otherwise coerce out-of-range values into the permitted set. This applies to all three public entry points of the batch pipeline: the batch encoder, the batch decoder, and the Lloyd-Max codebook computation.
+
+**Lower bound (b ≥ 2).** At `b = 1`, a Lloyd-Max scalar quantizer reduces to a two-centroid sign classifier, which falls outside the rate-distortion regime analyzed in Theorem 15. The analytical MSE bound of Theorem 15(a) and the Lloyd-Max dominance claim of Theorem 15(b) are stated for `b ≥ 2`; the measured ρ values in §4.8.7 are reported only for `b ∈ {2, 3, 4, 5}`. PolarQuant's concentration-based analysis (Han et al. 2025), which the batch pipeline relies on, similarly requires `b ≥ 2` for its distortion-rate characterization to apply. Permitting `b = 1` would silently extend the implementation beyond the verified theory.
+
+**Upper bound (b ≤ 8).** At `b = 8`, the per-coordinate Lloyd-Max MSE ε_q ≈ 9.7 × 10⁻⁷ (extrapolating the trend in §4.8.7's Table using the ρ ≈ 2.3 plateau and the Shannon slope 2^(−2b)). The reconstructed per-component error magnitude is √ε_q ≈ 10⁻³ — three decimal places per opinion coordinate. For the intended IoT deployment (sensor-derived beliefs with inherent measurement uncertainty well above 10⁻³, and compliance decisions made on the belief/disbelief ratio rather than absolute fine structure), additional bits beyond b = 8 encode precision that does not represent real measurement information. Setting the ceiling at `b = 8` also preserves a one-octet-per-coordinate maximum, which aligns the packed-coordinate region of the wire format with byte boundaries — a useful property for debugging and for potential future variants that pack per-coordinate metadata alongside values.
+
+**Consequences for the wire format.** The bit-width `b` is NOT transmitted in the batch wire format (§4.8.4). Both encoder and decoder are assumed to know `b` out of band (typically fixed per deployment or negotiated at session setup). The normative range above therefore applies symmetrically to both ends: an encoder producing a wire payload at `b ∉ {2..8}` produces a message that conformant decoders MUST reject, regardless of how the decoder is informed of `b`.
+
+**Conformance.** The reference implementation enforces this range at runtime in `encode_batch`, `decode_batch`, and `lloyd_max_codebook` (see `src/cbor_ld_ex/batch.py::_validate_bits`). Any out-of-range or wrong-type `bits` argument raises `ValueError` before any wire-format processing begins. Implementations in other languages MUST enforce an equivalent check; the specific exception mechanism is language-specific, but the contract — fail fast, before side effects — is normative.
+
+---
+
 ---
 
 ### 4.9 Polar Simplex Encoding (Precision Mode 11 — Deferred)
@@ -2138,4 +2158,4 @@ CBOR-LD-ex is >10× smaller than CBOR-LD for the same annotation content, and ~3
 
 ---
 
-*End of document. v0.4.4 changes: Phase 0 TurboQuant theory integration — §4.6 (rate efficiency, Theorems 9–10), §4.7 (QJL-inspired residual correction, Theorems 12–13), §4.8 (PolarQuant batch compression, Theorems 14–15, Definitions 32–36), §4.9 (polar simplex — deferred), §11.6–11.8 (TurboQuant comparative analysis, three-pillar advantage argument), GAP-11 through GAP-14, new references. Review hardening: §7.6 delta error recovery model (PKI, NACK, I-frame/P-frame analogy), §4.8.3 concrete RHT execution timing, §4.8.6 spatial-vs-temporal batching clarification, §9.3+§4.8.1 mandatory Byzantine-before-batch ordering. v0.4.3 changes: deterministic lower-index tie-breaker for multinomial simplex projection sort (§4.4 Theorem 3c), delta-multinomial ban — precision_mode=11 MUST NOT combine with has_multinomial=1 (§7.6). v0.4.2 changes: integer simplex projection replaces broken iterative clamping for multinomial (§4.4 Theorem 3c, Definition 11), keyframe-first mandate for delta cold start (§7.6). v0.4.1 changes: delta-to-full fallback on range overflow (§7.6), trust_precision_mode field in trust_info block (§5.1), symmetric clamping mandate for temporal decay and expiry trigger outputs (§7.1). v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), implementation updates for v0.4.x spec changes.*
+*End of document. v0.4.6 changes: §4.8.8 adds a normative bit-width range b ∈ {2, 3, 4, 5, 6, 7, 8} for batch quantization (Definition 35), with lower bound justified by Theorem 15's applicability regime and upper bound justified by diminishing returns relative to sensor measurement uncertainty. Reference implementation enforces the range at runtime via `_validate_bits` in `encode_batch`, `decode_batch`, and `lloyd_max_codebook`. Pre-existing docstring escape-sequence artifacts in the reference implementation normalized to proper Unicode. v0.4.4 changes: Phase 0 TurboQuant theory integration — §4.6 (rate efficiency, Theorems 9–10), §4.7 (QJL-inspired residual correction, Theorems 12–13), §4.8 (PolarQuant batch compression, Theorems 14–15, Definitions 32–36), §4.9 (polar simplex — deferred), §11.6–11.8 (TurboQuant comparative analysis, three-pillar advantage argument), GAP-11 through GAP-14, new references. Review hardening: §7.6 delta error recovery model (PKI, NACK, I-frame/P-frame analogy), §4.8.3 concrete RHT execution timing, §4.8.6 spatial-vs-temporal batching clarification, §9.3+§4.8.1 mandatory Byzantine-before-batch ordering. v0.4.3 changes: deterministic lower-index tie-breaker for multinomial simplex projection sort (§4.4 Theorem 3c), delta-multinomial ban — precision_mode=11 MUST NOT combine with has_multinomial=1 (§7.6). v0.4.2 changes: integer simplex projection replaces broken iterative clamping for multinomial (§4.4 Theorem 3c, Definition 11), keyframe-first mandate for delta cold start (§7.6). v0.4.1 changes: delta-to-full fallback on range overflow (§7.6), trust_precision_mode field in trust_info block (§5.1), symmetric clamping mandate for temporal decay and expiry trigger outputs (§7.1). v0.4.0 changes: symmetric clamping (§4.2), delta mode via precision_mode=11 (§5.1, §7.6, Table 1, Appendix B), mandatory Tier 3 extension block ordering (§5.1), tiered provenance digest security with 128-bit audit-grade option (§9.4), updated Shannon efficiency analysis (§11.2, §11.5). Next revision will address: §8 (Graph Operations), implementation updates for v0.4.x spec changes.*
