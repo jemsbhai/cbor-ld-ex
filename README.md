@@ -20,7 +20,7 @@ Built on [jsonld-ex](https://pypi.org/project/jsonld-ex/) and its compliance alg
 - **Security primitives** — annotation digests, Byzantine fusion metadata, chained provenance (16 bytes per entry, zero waste)
 - **Transport-agnostic** — identical payloads over MQTT and CoAP
 - **Three formal axioms** — backward compatibility, algebraic closure, quantization correctness
-- **820 tests** including exhaustive 8-bit verification (32,896 pairs), Hypothesis property tests, and batch compression verification
+- **968 tests** including exhaustive 8-bit verification (32,896 pairs), Hypothesis property tests, batch compression verification, benchmark reproducibility, and end-to-end simulation
 
 ## 6-Way Encoding Benchmark
 
@@ -173,6 +173,7 @@ opinions = [
 ] * 16  # 32 total
 
 # Encode: RHT + Lloyd-Max quantization at 3 bits/coordinate
+# bits must be in {2, 3, 4, 5, 6, 7, 8} — protocol-enforced range (§4.8.8)
 wire = encode_batch(opinions, bits=3, quantizer='lloyd_max')
 # Wire format: seed_mode(4) + norm_q(2) + packed_coords
 # MSB of seed_mode = 1 (Lloyd-Max mode flag, self-describing)
@@ -226,7 +227,9 @@ All three axioms are verified by cross-cutting property tests including exhausti
 | `temporal.py` | Bit-packed decay, log-scale half-life, expiry/review triggers |
 | `security.py` | Annotation digests, Byzantine metadata, provenance chains |
 | `codec.py` | Full encode/decode pipeline, `ContextRegistry`, Shannon bit analysis |
-| `batch.py` | Batch compression — RHT + Lloyd-Max quantization (§4.8) |
+| `batch.py` | Batch compression — RHT + Lloyd-Max quantization, protocol-pinned constants (`_C_LOOKUP`, `_NORM_MAX_LOOKUP`), bit-width validation (§4.8) |
+| `bitpack.py` | Bit-level packing — MSB-first BitWriter/BitReader (§7.4, §4.4) |
+| `stream.py` | Stateful stream decoder — delta opinion reconstruction (§7.6) |
 | `transport.py` | MQTT + CoAP adapters, 6-way `full_benchmark()` engine |
 
 ## Development
@@ -253,26 +256,33 @@ cborldex/
 │   ├── temporal.py       # Temporal extensions — decay, triggers, BitWriter/BitReader
 │   ├── security.py       # Digests, Byzantine metadata, provenance chains
 │   ├── codec.py          # Full codec, ContextRegistry, bit-level analysis
-│   ├── batch.py          # Batch compression — RHT, Lloyd-Max, Shannon analysis
+│   ├── batch.py          # Batch compression — RHT, Lloyd-Max, protocol-pinned constants, bit-width validation (§4.8)
+│   ├── bitpack.py        # Bit-level packing — MSB-first BitWriter/BitReader (§7.4, §4.4)
+│   ├── stream.py         # Stateful stream decoder — delta opinion reconstruction (§7.6)
 │   └── transport.py      # MQTT + CoAP adapters, 6-way benchmark engine
 ├── tests/
-│   ├── test_opinions.py      # 38 tests — quantization, Hypothesis properties
-│   ├── test_headers.py       # 28 tests — Tier 1/2/3 header roundtrips
-│   ├── test_annotations.py   # 15 tests — assembly, CBOR tag, wire format
-│   ├── test_temporal.py      # 65 tests — bit-packed extensions, decay, triggers
-│   ├── test_security.py      # 33 tests — digests, Byzantine, provenance chains
-│   ├── test_codec.py         # 46 tests — full pipeline, payload comparison
+│   ├── test_opinions.py      # 99 tests — quantization, Hypothesis properties
+│   ├── test_headers.py       # 33 tests — Tier 1/2/3 header roundtrips
+│   ├── test_annotations.py   # 22 tests — assembly, CBOR tag, wire format
+│   ├── test_temporal.py      # 68 tests — bit-packed extensions, decay, triggers
+│   ├── test_security.py      # 63 tests — digests, Byzantine, provenance chains
+│   ├── test_codec.py         # 86 tests — full pipeline, payload comparison
 │   ├── test_axioms.py        # 19 tests — cross-cutting axiom verification
-│   ├── test_batch.py         # 253 tests — RHT, Lloyd-Max, batch pipeline, Shannon
+│   ├── test_batch.py         # 365 tests — RHT, Lloyd-Max, batch pipeline, bit-width validation, norm_max lookup
+│   ├── test_stream.py        # 18 tests — stateful delta reconstruction, keyframe mandate
+│   ├── test_benchmark.py     # 121 tests — publication-quality evaluation framework
+│   ├── test_simulation.py    # 50 tests — Tier 1→2→3 end-to-end pipeline
 │   └── test_transport.py     # 24 tests — MQTT, CoAP, 6-way benchmark
 ├── spec/
-│   ├── FORMAL_MODEL.md       # Formal specification v0.4.5-draft
+│   ├── FORMAL_MODEL.md       # Formal specification v0.4.6-draft
 │   └── IMPLEMENTATION_PLAN.md
+├── benchmarks/
+│   └── cbor_ld_ex_benchmark/ # Publication benchmark & simulation framework
 ├── pyproject.toml
 └── LICENSE
 ```
 
-**820 tests total**, all passing.
+**968 tests total**, all passing.
 
 ## References
 
