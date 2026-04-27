@@ -2048,6 +2048,7 @@ When N ≥ 32, CBOR-LD-ex batch encoding adopts PolarQuant's RHT rotation and ma
 | GAP-12 | Residual correction for operator chains | **Resolved** | §4.7 (Theorems 12–13) |
 | GAP-13 | Batch opinion compression | **Resolved** | §4.8 (Theorems 14–15) |
 | GAP-14 | Polar simplex encoding (mode 11) | **Deferred** | §4.9 |
+| GAP-15 | Batch norm_max wire-format index (4-bit N-code) | **Deferred** | §4.8.4 (future v0.5.0) |
 
 ---
 
