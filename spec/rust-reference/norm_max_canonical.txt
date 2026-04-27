@@ -1,0 +1,40 @@
+# norm_max_canonical.txt — Rust-canonical sqrtf(float32(3*N)) values
+#
+# PURPOSE:
+#   Cross-reference file for the _NORM_MAX_LOOKUP table in batch.py.
+#   When the Rust port (cborldex-rs) catches up to v0.4.6, this file
+#   should be regenerated from actual `rustc` output to confirm
+#   bit-exact agreement with the Python reference implementation.
+#
+# GENERATION (Rust):
+#   for n in [4, 8, 10, 16, 20, 32, 36, 50, 64, 100, 128, 200, 256, 512, 1024] {
+#       let val: f32 = ((3 * n) as f32).sqrt();
+#       let bits: u32 = val.to_bits();
+#       println!("N={:>4}  3N={:>4}  sqrtf={:.8}  hex=0x{:08x}", n, 3*n, val, bits);
+#   }
+#
+# CURRENT STATUS: STUB
+#   The 15 values below are from numpy.float32 native sqrt, which is
+#   empirically bit-exact with Python's _f32(math.sqrt(3*N)) for all
+#   integer N in [1, 100000]. Awaiting Rust port to confirm against
+#   actual rustc f32 sqrt output.
+#
+# EXPECTED VALUES (to be confirmed by Rust):
+#   N      3N     hex          decimal (approx)
+#   4      12     0x405db3d7   3.46410155
+#   8      24     0x409cc471   4.89897966
+#   10     30     0x40af456f   5.47722578
+#   16     48     0x40ddb3d7   6.92820311
+#   20     60     0x40f7def6   7.74596691
+#   32     96     0x411cc471   9.79795933
+#   36     108    0x412646e1   10.39230442
+#   50     150    0x4143f58d   12.24744892
+#   64     192    0x415db3d7   13.85640621
+#   100    300    0x418a9067   17.32050705
+#   128    384    0x419cc471   19.59591866
+#   200    600    0x41c3f58d   24.49489784
+#   256    768    0x41ddb3d7   27.71281242
+#   512    1536   0x421cc471   39.19183731
+#   1024   3072   0x425db3d7   55.42562485
+#
+# 16th slot intentionally reserved for future 4-bit N-code wire extension.
