@@ -201,7 +201,7 @@ def format_frame_fit_table(results: list[dict]) -> str:
 def write_csv(results: list[dict], path: Path):
     """Write per-format mean sizes as CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         header = ["format"] + [r["dataset_label"] for r in results]
         writer.writerow(header)
@@ -268,7 +268,7 @@ def main():
     tables_dir.mkdir(parents=True, exist_ok=True)
 
     md_path = tables_dir / "wire_sizes.md"
-    md_path.write_text(full_md)
+    md_path.write_text(full_md, encoding="utf-8")
     print(f"\n  Markdown written to {md_path}")
 
     csv_path = tables_dir / "wire_sizes.csv"

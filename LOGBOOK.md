@@ -238,10 +238,29 @@ is the slowest. Protobuf is the fastest (minimal parsing overhead).
 5. Report as records/second and μs/record
 
 ### Results
-[To be filled after execution]
+- CBOR-LD-ex decode: 3.9 (Intel Lab) to 11.5 (SWaT) μs/record
+  (259K to 87K records/sec)
+- JSON-LD (json.loads): 2.5 to 9.6 μs — CPython text parsing is
+  well-optimized; only 1.6× faster than CBOR-LD-ex
+- jsonld-ex (cbor2.loads, no decompression): fastest at 2.0–6.1 μs
+- Our manual Protobuf/MessagePack decoders are slowest (Python loops):
+  30–33 μs for SWaT. Compiled C decoders would be much faster.
+- All formats scale linearly with field count (SWaT 63 fields ≈ 4×
+  Intel Lab 4 fields ≈ 4× latency)
+- Std consistently < 1 μs across all formats — stable measurements
+
+### Observations
+- CBOR-LD-ex overhead vs plain CBOR-LD is ~1 μs (annotation bit-unpack)
+  — negligible for IoT duty cycles (seconds between readings)
+- Protobuf/FlatBuffers/MessagePack slowness is an artifact of our
+  manual Python decoders — compiled implementations would be faster.
+  Paper must note: "Python reference implementation; host-labeled."
+- Decode is NOT the bottleneck for constrained IoT — radio TX time
+  dominates (e.g., LoRaWAN SF12 airtime ~1.8s for 51B)
 
 ### Artifacts
 - Script: benchmarks/run_decode_throughput.py
+- Output: papers/cborld-ex-main/tables/decode_throughput.{md,csv}
 
 ---
 

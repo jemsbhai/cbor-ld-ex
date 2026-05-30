@@ -67,10 +67,33 @@ MQTT and CoAP transport adapters produce identical payloads.
   mean is ~5× (79.8% compression). Paper must lead with full-message.
 - Real SF12 (51B) feasibility: smallest CBOR-LD-ex message is 55B — exceeds
   SF12. Honest claim is per-record fit fraction, not universal fit.
+- Decode throughput: Protobuf/FlatBuffers/MessagePack numbers are from
+  manual Python decoders — compiled C implementations would be significantly
+  faster. Paper must note "Python reference implementation; host-labeled."
+
+### Decode Throughput (EXP-007)
+
+CBOR-LD-ex decode latency is 3.9–11.5 μs/record (259K–87K records/sec),
+competitive with JSON-LD (2.5–9.6 μs) despite additional annotation
+bit-unpacking. The overhead vs plain CBOR-LD is ~1 μs — negligible for
+IoT duty cycles where radio TX time dominates.
+
+All formats scale linearly with field count. Decode is NOT the bottleneck
+for constrained IoT applications.
 
 ---
 
 ## Raw Findings Log
+
+### 2026-05-30 -- EXP-007: Decode throughput (9 formats × 4 datasets)
+
+**Key result:** CBOR-LD-ex decode: 3.9–11.5 μs/record (259K–87K rec/s).
+JSON-LD: 2.5–9.6 μs (only 1.6× faster). Overhead vs CBOR-LD: ~1 μs.
+
+**Details:** 100 records × 100 iterations × 5 repeats, 3 warmup excluded.
+All formats scale linearly with field count. Manual Python Protobuf/
+MsgPack decoders are slowest (30–33 μs for SWaT 63-field records).
+Compiled C would be faster. See `papers/cborld-ex-main/tables/decode_throughput.md`.
 
 ### 2026-05-30 -- EXP-006: Wire-size experiment (9 formats × 4 real datasets)
 
