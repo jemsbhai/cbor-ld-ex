@@ -62,7 +62,7 @@ UCI_AQ_COLUMNS = (
     "Date", "Time",
     "CO_GT", "PT08_S1_CO", "NMHC_GT", "C6H6_GT",
     "PT08_S2_NMHC", "NOx_GT", "PT08_S3_NOx",
-    "NO2_GT", "PT08_S4_NO2", "T", "RH", "AH",
+    "NO2_GT", "PT08_S4_NO2", "PT08_S5_O3", "T", "RH", "AH",
 )
 
 # 39 numeric features from CIC-IoT-2023, in CSV column order.
@@ -955,6 +955,7 @@ _UCI_AQ_COLUMN_MAP = {
     "PT08.S3(NOx)": "PT08_S3_NOx",
     "NO2(GT)": "NO2_GT",
     "PT08.S4(NO2)": "PT08_S4_NO2",
+    "PT08.S5(O3)": "PT08_S5_O3",
     "T": "T",
     "RH": "RH",
     "AH": "AH",

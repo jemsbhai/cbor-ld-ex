@@ -135,6 +135,7 @@ SYNTHETIC_UCI_AQ = {
     "PT08_S3_NOx": 1056.0,
     "NO2_GT": 113.0,
     "PT08_S4_NO2": 1692.0,
+    "PT08_S5_O3": 1268.0,
     "T": 13.6,
     "RH": 48.9,
     "AH": 0.7578,
@@ -853,7 +854,8 @@ class TestSchemaConstants:
         """UCI Air Quality has the expected columns."""
         expected = {"Date", "Time", "CO_GT", "PT08_S1_CO", "NMHC_GT",
                     "C6H6_GT", "PT08_S2_NMHC", "NOx_GT", "PT08_S3_NOx",
-                    "NO2_GT", "PT08_S4_NO2", "T", "RH", "AH"}
+                    "NO2_GT", "PT08_S4_NO2", "PT08_S5_O3",
+                    "T", "RH", "AH"}
         assert set(UCI_AQ_COLUMNS) == expected
 
     def test_ciciot_columns_count(self):
@@ -973,10 +975,10 @@ class TestLoadUciAirQuality:
     def uci_csv(self, tmp_path):
         f = tmp_path / "AirQualityUCI.csv"
         # Semicolon separator, comma decimal, trailing semicolons
-        header = "Date;Time;CO(GT);PT08.S1(CO);NMHC(GT);C6H6(GT);PT08.S2(NMHC);NOx(GT);PT08.S3(NOx);NO2(GT);PT08.S4(NO2);T;RH;AH;;\n"
-        row1 = "10/03/2004;18.00.00;2,6;1360;150;11,9;1046;166;1056;113;1692;13,6;48,9;0,7578;;\n"
-        row2 = "10/03/2004;19.00.00;2;1292;112;9,4;955;103;1174;92;1559;13,3;47,7;0,7255;;\n"
-        row3 = "10/03/2004;20.00.00;-200;1402;-200;13,1;-200;174;1063;-200;1700;11,9;54;1,0000;;\n"
+        header = "Date;Time;CO(GT);PT08.S1(CO);NMHC(GT);C6H6(GT);PT08.S2(NMHC);NOx(GT);PT08.S3(NOx);NO2(GT);PT08.S4(NO2);PT08.S5(O3);T;RH;AH;;\n"
+        row1 = "10/03/2004;18.00.00;2,6;1360;150;11,9;1046;166;1056;113;1692;1268;13,6;48,9;0,7578;;\n"
+        row2 = "10/03/2004;19.00.00;2;1292;112;9,4;955;103;1174;92;1559;972;13,3;47,7;0,7255;;\n"
+        row3 = "10/03/2004;20.00.00;-200;1402;-200;13,1;-200;174;1063;-200;1700;1000;11,9;54;1,0000;;\n"
         f.write_text(header + row1 + row2 + row3)
         return f
 

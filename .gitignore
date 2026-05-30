@@ -56,3 +56,6 @@ papers/
 
 # One-off verification scripts
 verify_syndrome_localization.py
+
+# Downloaded datasets (not redistributable / cite-only)
+datasets/
