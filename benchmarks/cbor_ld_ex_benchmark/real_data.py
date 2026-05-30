@@ -20,6 +20,7 @@ dependencies. MessagePack follows the msgpack specification directly.
 import json
 import math
 import struct
+from pathlib import Path
 from typing import Optional
 
 import cbor2
@@ -932,3 +933,242 @@ def encode_record_all_formats(
         "flatbuffers": encode_as_flatbuffers(record, dataset),
         "msgpack": encode_as_msgpack(record, dataset),
     }
+
+
+# =====================================================================
+# 12. DATASET LOADERS
+#
+# Parse real dataset CSV files into list[dict] records.
+# Each loader handles the specific format quirks of its dataset.
+# =====================================================================
+
+# UCI AQ: map original CSV column names to our schema names.
+_UCI_AQ_COLUMN_MAP = {
+    "Date": "Date",
+    "Time": "Time",
+    "CO(GT)": "CO_GT",
+    "PT08.S1(CO)": "PT08_S1_CO",
+    "NMHC(GT)": "NMHC_GT",
+    "C6H6(GT)": "C6H6_GT",
+    "PT08.S2(NMHC)": "PT08_S2_NMHC",
+    "NOx(GT)": "NOx_GT",
+    "PT08.S3(NOx)": "PT08_S3_NOx",
+    "NO2(GT)": "NO2_GT",
+    "PT08.S4(NO2)": "PT08_S4_NO2",
+    "T": "T",
+    "RH": "RH",
+    "AH": "AH",
+}
+
+# CIC-IoT: sentinel for clipping infinity values.
+_INF_REPLACEMENT = 1.0e9
+
+# SWaT A8: columns to KEEP (Timestamp + sensors). Everything else dropped.
+_SWAT_KEEP_COLUMNS = frozenset({"Timestamp"} | set(SWAT_A8_SENSOR_COLUMNS))
+
+
+def load_intel_lab(path) -> list[dict]:
+    """Load Intel Lab sensor data.
+
+    Format: whitespace-separated, no header row.
+    Raw columns: date time epoch moteid temperature humidity light voltage
+    Date and time are combined into a single 'timestamp' string.
+    Rows with NaN sensor values are dropped.
+    """
+    path = Path(path)
+    records = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            # Columns: date(0) time(1) epoch(2) moteid(3) temp(4) hum(5) light(6) volt(7)
+            date_str = parts[0]
+            time_str = parts[1]
+            # Check for NaN in sensor columns (indices 4-7)
+            sensor_strs = parts[4:8]
+            if any(s.lower() == "nan" for s in sensor_strs):
+                continue
+            try:
+                record = {
+                    "timestamp": f"{date_str} {time_str}",
+                    "epoch": float(parts[2]),
+                    "moteid": int(parts[3]),
+                    "temperature": float(parts[4]),
+                    "humidity": float(parts[5]),
+                    "light": float(parts[6]),
+                    "voltage": float(parts[7]),
+                }
+                records.append(record)
+            except (ValueError, IndexError):
+                continue
+    return records
+
+
+def load_uci_air_quality(path) -> list[dict]:
+    """Load UCI Air Quality dataset.
+
+    Format: semicolon-separated CSV with header row.
+    European decimal format (commas in numbers).
+    Missing values encoded as -200 — rows containing -200 are dropped.
+    Column names mapped: CO(GT)->CO_GT, PT08.S1(CO)->PT08_S1_CO, etc.
+    Trailing empty columns (from trailing semicolons) are ignored.
+    """
+    path = Path(path)
+    records = []
+    with open(path, "r") as f:
+        # Parse header
+        header_line = f.readline().strip().rstrip(";")
+        raw_cols = [c.strip() for c in header_line.split(";")]
+        # Map to our column names, skip unmapped trailing columns
+        mapped_cols = []
+        for c in raw_cols:
+            if c in _UCI_AQ_COLUMN_MAP:
+                mapped_cols.append((c, _UCI_AQ_COLUMN_MAP[c]))
+
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            raw_vals = line.split(";")
+            # Check for -200 sentinel in numeric columns
+            has_missing = False
+            record = {}
+            for i, (raw_col, mapped_name) in enumerate(mapped_cols):
+                if i >= len(raw_vals):
+                    break
+                val_str = raw_vals[i].strip()
+                if mapped_name in ("Date", "Time"):
+                    record[mapped_name] = val_str
+                else:
+                    # European decimal: replace comma with dot
+                    val_str = val_str.replace(",", ".")
+                    try:
+                        val = float(val_str)
+                    except ValueError:
+                        has_missing = True
+                        break
+                    if val == -200.0:
+                        has_missing = True
+                        break
+                    record[mapped_name] = val
+            if has_missing or len(record) != len(mapped_cols):
+                continue
+            records.append(record)
+    return records
+
+
+def load_ciciot(path, max_rows: Optional[int] = None) -> list[dict]:
+    """Load CIC-IoT-2023 dataset.
+
+    Format: standard CSV with header row.
+    Data hygiene (matches aiiot2026 loader):
+      - inf values clipped to _INF_REPLACEMENT (1e9)
+      - Rows with NaN values dropped
+    """
+    path = Path(path)
+    records = []
+    with open(path, "r") as f:
+        header_line = f.readline().strip()
+        cols = [c.strip() for c in header_line.split(",")]
+
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            vals = line.split(",")
+            if len(vals) != len(cols):
+                continue
+            record = {}
+            has_nan = False
+            for col, val_str in zip(cols, vals):
+                val_str = val_str.strip()
+                if col == "Label":
+                    record[col] = val_str
+                else:
+                    try:
+                        val = float(val_str)
+                    except ValueError:
+                        has_nan = True
+                        break
+                    if math.isnan(val):
+                        has_nan = True
+                        break
+                    if math.isinf(val):
+                        val = _INF_REPLACEMENT
+                    record[col] = val
+            if has_nan:
+                continue
+            records.append(record)
+            if max_rows is not None and len(records) >= max_rows:
+                break
+    return records
+
+
+def load_swat_a8(
+    root, max_rows: Optional[int] = None
+) -> list[dict]:
+    """Load SWaT A8 dataset from session subdirectories.
+
+    Directory structure:
+      root/
+        _YYYYMMDD_HHMMSS/
+          YYYYMMDD_HHMMSS.csv
+
+    Each CSV has a header row. Only Timestamp + sensor columns
+    (SWAT_A8_SENSOR_COLUMNS) are kept; attack metadata is dropped.
+    Sessions are loaded in sorted directory-name order.
+    """
+    root = Path(root)
+    records = []
+
+    # Find session directories (start with underscore)
+    session_dirs = sorted(
+        d for d in root.iterdir()
+        if d.is_dir() and d.name.startswith("_")
+    )
+
+    for session_dir in session_dirs:
+        # Find CSV file in session directory
+        csv_files = list(session_dir.glob("*.csv"))
+        if not csv_files:
+            continue
+        csv_path = csv_files[0]
+
+        with open(csv_path, "r") as f:
+            header_line = f.readline().strip()
+            cols = [c.strip() for c in header_line.split(",")]
+            # Determine which column indices to keep
+            keep_indices = []
+            keep_names = []
+            for i, col in enumerate(cols):
+                if col in _SWAT_KEEP_COLUMNS:
+                    keep_indices.append(i)
+                    keep_names.append(col)
+
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                vals = line.split(",")
+                record = {}
+                for idx, name in zip(keep_indices, keep_names):
+                    if idx >= len(vals):
+                        continue
+                    val_str = vals[idx].strip()
+                    if name == "Timestamp":
+                        record[name] = val_str
+                    else:
+                        try:
+                            record[name] = float(val_str)
+                        except ValueError:
+                            record[name] = 0.0  # empty/missing sensor
+                records.append(record)
+                if max_rows is not None and len(records) >= max_rows:
+                    break
+        if max_rows is not None and len(records) >= max_rows:
+            break
+    return records

@@ -89,6 +89,11 @@ from cbor_ld_ex_benchmark.real_data import (
     frame_fit,
     # All-formats runner
     encode_record_all_formats,
+    # Dataset loaders
+    load_intel_lab,
+    load_uci_air_quality,
+    load_ciciot,
+    load_swat_a8,
 )
 
 # Existing package — used for independent verification
@@ -886,3 +891,251 @@ class TestSchemaConstants:
             f"Sensor columns include attack metadata: "
             f"{cols & attack_fields}"
         )
+
+
+# =====================================================================
+# 10. DATASET LOADERS
+#
+# CSV parsing tested with small synthetic temporary files that mirror
+# each dataset's actual format (separators, headers, decimal styles,
+# missing-value sentinels).
+# =====================================================================
+
+class TestLoadIntelLab:
+    """Intel Lab: whitespace-separated, no header, 8 raw columns."""
+
+    @pytest.fixture
+    def intel_csv(self, tmp_path):
+        """Create a small Intel Lab data file."""
+        f = tmp_path / "intel_lab.txt"
+        # Format: date time epoch moteid temp humidity light voltage
+        lines = [
+            "2004-03-31 03:38:15 1080618727 1 122.153 -3.91901 11.04 2.03397\n",
+            "2004-03-31 03:39:17 1080618789 2 19.988 37.093 45.08 2.699\n",
+            "2004-03-31 03:40:18 1080618850 1 19.318 38.462 45.08 2.686\n",
+        ]
+        f.write_text("".join(lines))
+        return f
+
+    def test_returns_list_of_dicts(self, intel_csv):
+        records = load_intel_lab(intel_csv)
+        assert isinstance(records, list)
+        assert len(records) == 3
+        assert all(isinstance(r, dict) for r in records)
+
+    def test_column_names(self, intel_csv):
+        """Records have exactly INTEL_LAB_COLUMNS keys."""
+        records = load_intel_lab(intel_csv)
+        expected = set(INTEL_LAB_COLUMNS)
+        for r in records:
+            assert set(r.keys()) == expected
+
+    def test_timestamp_combined(self, intel_csv):
+        """Date and time columns combined into 'timestamp' string."""
+        records = load_intel_lab(intel_csv)
+        assert records[0]["timestamp"] == "2004-03-31 03:38:15"
+
+    def test_numeric_types(self, intel_csv):
+        """Epoch is float, moteid is int, sensors are float."""
+        r = load_intel_lab(intel_csv)[0]
+        assert isinstance(r["epoch"], float)
+        assert isinstance(r["moteid"], int)
+        for col in ("temperature", "humidity", "light", "voltage"):
+            assert isinstance(r[col], float), f"{col} not float"
+
+    def test_values_correct(self, intel_csv):
+        """Parsed values match input."""
+        r = load_intel_lab(intel_csv)[0]
+        assert r["epoch"] == 1080618727.0
+        assert r["moteid"] == 1
+        assert math.isclose(r["temperature"], 122.153)
+        assert math.isclose(r["voltage"], 2.03397)
+
+    def test_skips_nan_rows(self, tmp_path):
+        """Rows with NaN sensor values are dropped."""
+        f = tmp_path / "intel_nan.txt"
+        lines = [
+            "2004-03-31 03:38:15 1080618727 1 122.153 -3.91901 11.04 2.03397\n",
+            "2004-03-31 03:39:17 1080618789 2 NaN NaN NaN 2.699\n",
+            "2004-03-31 03:40:18 1080618850 3 19.318 38.462 45.08 2.686\n",
+        ]
+        f.write_text("".join(lines))
+        records = load_intel_lab(f)
+        assert len(records) == 2
+        assert records[0]["moteid"] == 1
+        assert records[1]["moteid"] == 3
+
+
+class TestLoadUciAirQuality:
+    """UCI AQ: semicolon-separated, European decimals, -200 = missing."""
+
+    @pytest.fixture
+    def uci_csv(self, tmp_path):
+        f = tmp_path / "AirQualityUCI.csv"
+        # Semicolon separator, comma decimal, trailing semicolons
+        header = "Date;Time;CO(GT);PT08.S1(CO);NMHC(GT);C6H6(GT);PT08.S2(NMHC);NOx(GT);PT08.S3(NOx);NO2(GT);PT08.S4(NO2);T;RH;AH;;\n"
+        row1 = "10/03/2004;18.00.00;2,6;1360;150;11,9;1046;166;1056;113;1692;13,6;48,9;0,7578;;\n"
+        row2 = "10/03/2004;19.00.00;2;1292;112;9,4;955;103;1174;92;1559;13,3;47,7;0,7255;;\n"
+        row3 = "10/03/2004;20.00.00;-200;1402;-200;13,1;-200;174;1063;-200;1700;11,9;54;1,0000;;\n"
+        f.write_text(header + row1 + row2 + row3)
+        return f
+
+    def test_returns_list_of_dicts(self, uci_csv):
+        records = load_uci_air_quality(uci_csv)
+        assert isinstance(records, list)
+        assert all(isinstance(r, dict) for r in records)
+
+    def test_column_names_mapped(self, uci_csv):
+        """Column names mapped: CO(GT)->CO_GT, PT08.S1(CO)->PT08_S1_CO."""
+        records = load_uci_air_quality(uci_csv)
+        expected = set(UCI_AQ_COLUMNS)
+        for r in records:
+            assert set(r.keys()) == expected
+
+    def test_european_decimals_parsed(self, uci_csv):
+        """Commas in numbers converted to dots."""
+        records = load_uci_air_quality(uci_csv)
+        r = records[0]
+        assert math.isclose(r["CO_GT"], 2.6)
+        assert math.isclose(r["C6H6_GT"], 11.9)
+        assert math.isclose(r["AH"], 0.7578)
+
+    def test_missing_sentinel_dropped(self, uci_csv):
+        """Rows with -200 sentinel values are dropped."""
+        records = load_uci_air_quality(uci_csv)
+        # Row 3 has multiple -200 values — should be dropped.
+        assert len(records) == 2
+
+    def test_numeric_types(self, uci_csv):
+        r = load_uci_air_quality(uci_csv)[0]
+        assert isinstance(r["Date"], str)
+        assert isinstance(r["Time"], str)
+        for col in ("CO_GT", "PT08_S1_CO", "T", "RH", "AH"):
+            assert isinstance(r[col], float), f"{col} not float"
+
+
+class TestLoadCiciot:
+    """CIC-IoT-2023: standard CSV, inf/NaN handling, max_rows."""
+
+    @pytest.fixture
+    def ciciot_csv(self, tmp_path):
+        f = tmp_path / "Merged01.csv"
+        cols = list(CICIOT_FEATURE_COLUMNS) + ["Label"]
+        header = ",".join(cols) + "\n"
+        # Normal row
+        vals1 = ["54.0"] * 39 + ["BENIGN"]
+        row1 = ",".join(vals1) + "\n"
+        # Row with inf in Rate (col index 3)
+        vals2 = list(vals1)
+        vals2[3] = "inf"
+        row2 = ",".join(vals2) + "\n"
+        # Row with NaN in Std (col index 34)
+        vals3 = list(vals1)
+        vals3[34] = "NaN"
+        row3 = ",".join(vals3) + "\n"
+        # Another normal row
+        vals4 = ["12.5"] * 39 + ["DDOS-TCP_FLOOD"]
+        row4 = ",".join(vals4) + "\n"
+        f.write_text(header + row1 + row2 + row3 + row4)
+        return f
+
+    def test_returns_list_of_dicts(self, ciciot_csv):
+        records = load_ciciot(ciciot_csv)
+        assert isinstance(records, list)
+        assert all(isinstance(r, dict) for r in records)
+
+    def test_column_names(self, ciciot_csv):
+        records = load_ciciot(ciciot_csv)
+        expected = set(CICIOT_FEATURE_COLUMNS) | {"Label"}
+        for r in records:
+            assert set(r.keys()) == expected
+
+    def test_nan_rows_dropped(self, ciciot_csv):
+        """Rows with NaN are dropped (row 3)."""
+        records = load_ciciot(ciciot_csv)
+        # 4 data rows minus 1 NaN row = 3
+        assert len(records) == 3
+
+    def test_inf_clipped(self, ciciot_csv):
+        """inf values clipped to large finite number."""
+        records = load_ciciot(ciciot_csv)
+        # Row 2 (after header) has inf in Rate.
+        # After NaN drop (row 3 dropped), row 2 is at index 1.
+        inf_row = records[1]
+        assert math.isfinite(inf_row["Rate"]), "inf not clipped"
+        assert inf_row["Rate"] > 1e6, "clipped value too small"
+
+    def test_max_rows(self, ciciot_csv):
+        """max_rows limits output."""
+        records = load_ciciot(ciciot_csv, max_rows=2)
+        assert len(records) <= 2
+
+    def test_label_preserved(self, ciciot_csv):
+        records = load_ciciot(ciciot_csv)
+        assert records[0]["Label"] == "BENIGN"
+
+
+class TestLoadSwatA8:
+    """SWaT A8: multi-session directories, sensor-only columns."""
+
+    @pytest.fixture
+    def swat_root(self, tmp_path):
+        """Create a mini SWaT A8 directory structure."""
+        # Two sessions, each with one CSV.
+        cols = ["Timestamp", "Annotation", "FIT101", "LIT101",
+                "AIT201", "Attack Name", "Attack State"]
+        header = ",".join(cols) + "\n"
+        vals1 = "22/06/2021 09:37:05 AM,,0.0,822.463,33.485,,\n"
+        vals2 = "22/06/2021 09:37:06 AM,,0.1,822.738,33.490,,\n"
+
+        s1 = tmp_path / "_20210622_093704"
+        s1.mkdir()
+        (s1 / "20210622_093704.csv").write_text(header + vals1)
+
+        s2 = tmp_path / "_20210623_095710"
+        s2.mkdir()
+        (s2 / "20210623_095710.csv").write_text(header + vals2)
+
+        return tmp_path
+
+    def test_returns_list_of_dicts(self, swat_root):
+        records = load_swat_a8(swat_root)
+        assert isinstance(records, list)
+        assert all(isinstance(r, dict) for r in records)
+
+    def test_combines_sessions(self, swat_root):
+        """Records loaded from all session subdirectories."""
+        records = load_swat_a8(swat_root)
+        assert len(records) == 2
+
+    def test_excludes_attack_columns(self, swat_root):
+        """Attack metadata columns excluded from output."""
+        records = load_swat_a8(swat_root)
+        for r in records:
+            assert "Attack Name" not in r
+            assert "Attack State" not in r
+            assert "Annotation" not in r
+
+    def test_includes_sensor_columns(self, swat_root):
+        """Timestamp + sensor columns present."""
+        records = load_swat_a8(swat_root)
+        for r in records:
+            assert "Timestamp" in r
+            assert "FIT101" in r
+            assert "LIT101" in r
+            assert "AIT201" in r
+
+    def test_numeric_types(self, swat_root):
+        r = load_swat_a8(swat_root)[0]
+        assert isinstance(r["Timestamp"], str)
+        assert isinstance(r["FIT101"], float)
+        assert isinstance(r["LIT101"], float)
+
+    def test_values_correct(self, swat_root):
+        r = load_swat_a8(swat_root)[0]
+        assert math.isclose(r["FIT101"], 0.0)
+        assert math.isclose(r["LIT101"], 822.463)
+
+    def test_max_rows(self, swat_root):
+        records = load_swat_a8(swat_root, max_rows=1)
+        assert len(records) == 1
