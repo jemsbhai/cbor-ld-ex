@@ -1009,6 +1009,101 @@ def load_intel_lab(path) -> list[dict]:
     return records
 
 
+# =====================================================================
+# 13. EXPERIMENT RUNNER
+# =====================================================================
+
+def _statistics(values: list[int]) -> dict:
+    """Compute mean, std, min, max, median for a list of ints."""
+    n = len(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    std = math.sqrt(variance)
+    sorted_vals = sorted(values)
+    if n % 2 == 1:
+        median = float(sorted_vals[n // 2])
+    else:
+        median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+    return {
+        "sizes": values,
+        "mean": mean,
+        "std": std,
+        "min": min(values),
+        "max": max(values),
+        "median": median,
+    }
+
+
+def run_wire_size_experiment(
+    records: list[dict],
+    dataset: str,
+) -> dict:
+    """Run the wire-size experiment on a list of records.
+
+    Encodes each record in all 9 formats, computes per-format
+    size statistics, compression ratios vs JSON-LD, and frame-fit
+    counts per MTU threshold.
+
+    Returns:
+        {
+            "dataset": str,
+            "n_records": int,
+            "per_format": {format_name: {sizes, mean, std, min, max, median}},
+            "compression_ratios": {format_name: geometric_mean_ratio_vs_json_ld},
+            "frame_fit": {mtu_name: {format_name: count_that_fit}},
+        }
+    """
+    # Collect per-record sizes for each format.
+    format_sizes: dict[str, list[int]] = {fmt: [] for fmt in [
+        "json_ld", "jsonldex_cbor_ld", "cbor_ld", "cbor_ld_ex",
+        "senml_json", "senml_cbor",
+        "protobuf", "flatbuffers", "msgpack",
+    ]}
+
+    for record in records:
+        encoded = encode_record_all_formats(record, dataset)
+        for fmt, wire_bytes in encoded.items():
+            format_sizes[fmt].append(len(wire_bytes))
+
+    # Per-format statistics.
+    per_format = {fmt: _statistics(sizes) for fmt, sizes in format_sizes.items()}
+
+    # Compression ratios vs JSON-LD (per-record ratio, then mean).
+    json_ld_sizes = format_sizes["json_ld"]
+    compression_ratios = {}
+    for fmt, sizes in format_sizes.items():
+        if fmt == "json_ld":
+            compression_ratios[fmt] = 1.0
+        else:
+            ratios = [s / j for s, j in zip(sizes, json_ld_sizes) if j > 0]
+            if ratios:
+                # Geometric mean of ratios.
+                log_sum = sum(math.log(r) for r in ratios)
+                compression_ratios[fmt] = math.exp(log_sum / len(ratios))
+            else:
+                compression_ratios[fmt] = 0.0
+
+    # Frame-fit counts per MTU.
+    frame_fit_counts: dict[str, dict[str, int]] = {
+        mtu_name: {fmt: 0 for fmt in format_sizes}
+        for mtu_name in MTU_CONSTANTS
+    }
+    for fmt, sizes in format_sizes.items():
+        for size in sizes:
+            fit = frame_fit(size)
+            for mtu_name, fits in fit.items():
+                if fits:
+                    frame_fit_counts[mtu_name][fmt] += 1
+
+    return {
+        "dataset": dataset,
+        "n_records": len(records),
+        "per_format": per_format,
+        "compression_ratios": compression_ratios,
+        "frame_fit": frame_fit_counts,
+    }
+
+
 def load_uci_air_quality(path) -> list[dict]:
     """Load UCI Air Quality dataset.
 

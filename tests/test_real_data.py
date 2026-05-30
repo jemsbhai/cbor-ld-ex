@@ -94,6 +94,8 @@ from cbor_ld_ex_benchmark.real_data import (
     load_uci_air_quality,
     load_ciciot,
     load_swat_a8,
+    # Experiment runner
+    run_wire_size_experiment,
 )
 
 # Existing package — used for independent verification
@@ -1141,3 +1143,120 @@ class TestLoadSwatA8:
     def test_max_rows(self, swat_root):
         records = load_swat_a8(swat_root, max_rows=1)
         assert len(records) == 1
+
+
+# =====================================================================
+# 11. EXPERIMENT RUNNER
+#
+# run_wire_size_experiment: takes records + dataset name, returns
+# structured results with per-format sizes, compression ratios,
+# and frame-fit counts.
+# =====================================================================
+
+class TestRunWireSizeExperiment:
+    """Wire-size experiment runner produces correct structured results."""
+
+    @pytest.fixture
+    def result_intel(self):
+        """Run experiment on synthetic Intel Lab records."""
+        records = [SYNTHETIC_INTEL_LAB]  # single record
+        return run_wire_size_experiment(records, "intel_lab")
+
+    @pytest.fixture
+    def result_multi(self):
+        """Run experiment on multiple synthetic records."""
+        # Use two copies to test aggregation.
+        records = [SYNTHETIC_INTEL_LAB, SYNTHETIC_INTEL_LAB]
+        return run_wire_size_experiment(records, "intel_lab")
+
+    def test_returns_dict(self, result_intel):
+        assert isinstance(result_intel, dict)
+
+    def test_dataset_name(self, result_intel):
+        assert result_intel["dataset"] == "intel_lab"
+
+    def test_n_records(self, result_intel):
+        assert result_intel["n_records"] == 1
+
+    def test_per_format_has_all_formats(self, result_intel):
+        """Every format in ALL_FORMATS has an entry."""
+        pf = result_intel["per_format"]
+        for fmt in ALL_FORMATS:
+            assert fmt in pf, f"missing format: {fmt}"
+
+    def test_per_format_statistics_keys(self, result_intel):
+        """Each format entry has mean, std, min, max, median."""
+        required = {"sizes", "mean", "std", "min", "max", "median"}
+        for fmt, stats in result_intel["per_format"].items():
+            assert required.issubset(set(stats.keys())), (
+                f"{fmt} missing keys: {required - set(stats.keys())}"
+            )
+
+    def test_sizes_list_length(self, result_intel):
+        """sizes list has one entry per record."""
+        for fmt, stats in result_intel["per_format"].items():
+            assert len(stats["sizes"]) == 1, f"{fmt}: wrong sizes length"
+
+    def test_mean_equals_single_size(self, result_intel):
+        """With one record, mean == the single size."""
+        for fmt, stats in result_intel["per_format"].items():
+            assert stats["mean"] == stats["sizes"][0], (
+                f"{fmt}: mean != single size"
+            )
+
+    def test_multi_record_aggregation(self, result_multi):
+        """With identical records, std == 0."""
+        for fmt, stats in result_multi["per_format"].items():
+            assert stats["std"] == 0.0, f"{fmt}: std != 0 for identical records"
+            assert stats["min"] == stats["max"], f"{fmt}: min != max"
+
+    def test_compression_ratios_present(self, result_intel):
+        """Compression ratios vs JSON-LD are present for all formats."""
+        cr = result_intel["compression_ratios"]
+        for fmt in ALL_FORMATS:
+            assert fmt in cr, f"missing ratio for {fmt}"
+
+    def test_json_ld_ratio_is_one(self, result_intel):
+        """JSON-LD vs itself has ratio 1.0."""
+        assert result_intel["compression_ratios"]["json_ld"] == 1.0
+
+    def test_cbor_ld_ex_ratio_below_one(self, result_intel):
+        """CBOR-LD-ex is smaller than JSON-LD (ratio < 1)."""
+        assert result_intel["compression_ratios"]["cbor_ld_ex"] < 1.0
+
+    def test_frame_fit_has_all_mtus(self, result_intel):
+        """Frame-fit results cover all MTU thresholds."""
+        ff = result_intel["frame_fit"]
+        for mtu_name in MTU_CONSTANTS:
+            assert mtu_name in ff, f"missing MTU: {mtu_name}"
+
+    def test_frame_fit_counts_per_format(self, result_intel):
+        """Each MTU has a count for every format."""
+        for mtu_name, counts in result_intel["frame_fit"].items():
+            for fmt in ALL_FORMATS:
+                assert fmt in counts, (
+                    f"{mtu_name} missing format: {fmt}"
+                )
+                # Count is 0 or 1 (single record)
+                assert counts[fmt] in (0, 1)
+
+    def test_frame_fit_consistency(self, result_intel):
+        """Frame-fit count matches manual frame_fit() call."""
+        pf = result_intel["per_format"]
+        ff = result_intel["frame_fit"]
+        for fmt in ALL_FORMATS:
+            size = pf[fmt]["sizes"][0]
+            for mtu_name, mtu_val in MTU_CONSTANTS.items():
+                expected = 1 if size <= mtu_val else 0
+                assert ff[mtu_name][fmt] == expected, (
+                    f"{fmt}/{mtu_name}: size={size}, mtu={mtu_val}, "
+                    f"expected {expected}, got {ff[mtu_name][fmt]}"
+                )
+
+    @pytest.mark.parametrize("dataset", DATASET_NAMES)
+    def test_all_datasets_run(self, dataset):
+        """Experiment runs without error on all synthetic records."""
+        records = [SYNTHETIC_RECORDS[dataset]]
+        result = run_wire_size_experiment(records, dataset)
+        assert result["n_records"] == 1
+        assert len(result["per_format"]) == len(ALL_FORMATS)
