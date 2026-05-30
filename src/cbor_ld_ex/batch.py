@@ -962,9 +962,8 @@ def encode_batch(
         bits: Quantization bit-width per coordinate. Must be an int
             in [2, 8] (protocol-mandated range, enforced at runtime).
         seed: PRNG seed (31-bit, range [0, 2^31-1]), or None for random.
-        quantizer: None (default) to auto-detect from wire mode flag,
-            or 'lloyd_max'/'uniform' to validate against wire mode.
-            Raises ValueError if explicit quantizer contradicts wire.
+        quantizer: 'lloyd_max' (default) or 'uniform'. Sets the MSB
+            mode flag in the wire header for self-describing decoding.
 
     Returns:
         Wire bytes of length 6 + ceil(D × bits / 8).
@@ -1058,13 +1057,16 @@ def decode_batch(
         n_opinions: Number of opinions N that were encoded.
         bits: Quantization bit-width per coordinate. Must be an int
             in [2, 8] (protocol-mandated range, enforced at runtime).
-        quantizer: 'lloyd_max' (default) or 'uniform'.
+        quantizer: None (default) to auto-detect from the wire mode
+            flag, or 'lloyd_max'/'uniform' to validate against wire.
+            Raises ValueError if explicit quantizer contradicts wire mode.
 
     Returns:
         List of N opinions, each (b, d, u, a) with b+d+u=1, a ∈ [0,1].
 
     Raises:
-        ValueError: If bits is not an int in [2, 8].
+        ValueError: If bits is not an int in [2, 8], or if explicit
+            quantizer contradicts the wire mode flag.
     """
     _validate_bits(bits)
     # Unpack header (spec v0.4.5: seed MSB = quantizer mode flag)
