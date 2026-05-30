@@ -293,7 +293,28 @@ to N.
 5. Compare total wire cost: all-full vs first-full + rest-delta
 
 ### Results
-[To be filled after execution]
+- Opinion payload: BITS_8 = 3 bytes, DELTA_8 = 2 bytes (1B saving)
+- Per-reading saving: 1.0 byte (1.0% of total message)
+- Stream saving over 100 readings: 99 bytes (1.0%)
+- Zero fallbacks to full mode (opinion deltas fit int8 range)
+- Data fields dominate wire cost (~100B per reading); opinion is
+  only 3B of that. Delta saves 1B of the 3B opinion component.
+
+### Observations
+- Delta savings are modest (1.0%) because data fields are the
+  dominant wire cost, not the opinion. The honest framing: delta
+  mode is a micro-optimization for long-running streams, not a
+  headline compression feature.
+- Zero fallback confirms that adjacent readings from the same
+  mote produce slowly-varying opinions (sliding-window Beta mapping
+  changes by at most 1 evidence count per reading).
+- Over 10,000 readings (5.5 hours at 31s cadence), savings would
+  be ~10KB — meaningful for energy-constrained LoRaWAN devices
+  where every byte costs radio airtime.
+
+### Artifacts
+- Script: benchmarks/run_temporal_delta.py
+- Output: papers/cborld-ex-main/tables/temporal_delta.md
 
 ---
 
@@ -326,4 +347,23 @@ more compact than the equivalent JSON-LD representation.
 5. Compare wire sizes across tiers and vs JSON-LD
 
 ### Results
-[To be filled after execution]
+- Tier 1: 101B CBOR-LD-ex vs 416B JSON-LD = 0.243 ratio
+- Tier 2: 106B vs 451B = 0.235 ratio (header amortized over same data)
+- Tier 3: 202B vs 587B = 0.344 ratio (96B provenance chain added)
+- Annotation sizes: Tier 1 = 4B, Tier 2 = 9B, Tier 3 = 9B
+- Provenance: 16B per entry, 6 entries (5 motes + 1 fusion) = 96B
+- Fused opinion: b=0.750, d=0.211, u=0.039 (mote 3 dissent visible)
+
+### Observations
+- Mote 3 has inverted opinion (b=0.083, d=0.750) — its temperature
+  readings are outside the compliance threshold. Cumulative fusion
+  correctly weights this as minority dissent.
+- Compression ratio improves from Tier 1 to Tier 2 (0.243 → 0.235)
+  because the richer Tier 2 header (4B vs 1B) is offset by the JSON-LD
+  equivalent growing proportionally more (annotation dict overhead).
+- Tier 3 ratio increases (0.344) because provenance chain is a fixed
+  cost that doesn't compress via context compression.
+
+### Artifacts
+- Script: benchmarks/run_tier_simulation.py
+- Output: papers/cborld-ex-main/tables/tier_simulation.md

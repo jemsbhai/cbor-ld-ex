@@ -81,9 +81,41 @@ IoT duty cycles where radio TX time dominates.
 All formats scale linearly with field count. Decode is NOT the bottleneck
 for constrained IoT applications.
 
+### Temporal/Delta Streaming (EXP-008)
+
+Delta mode (DELTA_8) saves 1 byte per reading (3B → 2B opinion payload),
+a 1.0% total stream saving over 100 consecutive Intel Lab readings from
+mote 1. Data fields (~100B) dominate wire cost; the opinion component
+is only 3B. Zero fallbacks to full mode — adjacent readings produce
+slowly-varying opinions via sliding-window Beta mapping.
+
+Honest framing: delta is a micro-optimization for long-running streams,
+not a headline compression feature. Over 10K readings (5.5 hours at
+31s cadence), savings are ~10KB — meaningful for energy-constrained
+LoRaWAN devices.
+
+### Tier Pipeline on Real Data (EXP-009)
+
+Full Tier 1→2→3 pipeline on real Intel Lab data (5 motes, 10 readings
+each). Compression ratios vs JSON-LD: Tier 1 = 0.243, Tier 2 = 0.235
+(improves due to header amortization), Tier 3 = 0.344 (provenance chain
+adds 96B fixed cost). Mote 3’s out-of-threshold readings produce an
+inverted opinion (b=0.083, d=0.750), correctly weighted as minority
+dissent by cumulative fusion (fused b=0.750, d=0.211, u=0.039).
+
 ---
 
 ## Raw Findings Log
+
+### 2026-05-30 -- EXP-009: Tier 1→2→3 on real Intel Lab data
+
+**Key result:** Tier 1 = 0.243, Tier 2 = 0.235, Tier 3 = 0.344 vs JSON-LD.
+Provenance chain: 96B (6 entries × 16B). Mote 3 dissent correctly fused.
+
+### 2026-05-30 -- EXP-008: Temporal/delta streaming (Intel Lab mote 1)
+
+**Key result:** Delta saves 1B/reading (1.0% total). 99B over 100 readings.
+Zero fallbacks. Data fields dominate; opinion is 3B of ~100B message.
 
 ### 2026-05-30 -- EXP-007: Decode throughput (9 formats × 4 datasets)
 
