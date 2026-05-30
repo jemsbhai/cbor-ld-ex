@@ -2,7 +2,162 @@
 
 ---
 
-## EXP-000: Wire-Size Experiment (9 formats × 4 datasets)
+## EXP-001: Synthetic 38-Scenario Benchmark (6-Way Comparison)
+
+**Date:** pre-2026-05-30 (accumulated across multiple sessions)
+**Researcher:** Muntaser Syed
+**Type:** computational
+**Status:** completed
+
+### Hypothesis
+CBOR-LD-ex produces smaller wire representations than JSON-LD, jsonld-ex
+CBOR-LD, and standard CBOR-LD (with and without annotation) across a
+systematic matrix of document sizes, annotation tiers, and precision modes.
+
+### Independent Variables
+- Document profile: minimal_temperature, environmental_monitor,
+  industrial_machine, aggregate_fleet (4 profiles)
+- Annotation tier: Tier 1 (1B), Tier 2 (4B)
+- Precision mode: 8-bit, 16-bit, 32-bit
+- Compliance status: COMPLIANT, NON_COMPLIANT, INSUFFICIENT
+- Extensions: none, temporal, temporal+trigger
+
+### Dependent Variables / Metrics
+- Wire size (bytes) per encoding: JSON-LD, jsonld-ex CBOR-LD, our CBOR-LD
+  (data only), jsonld-ex + annotation, our CBOR-LD + annotation, CBOR-LD-ex
+- Compression ratio vs JSON-LD (%)
+- Bit efficiency: Shannon information bits / wire bits (%)
+
+### Results
+- 38 scenarios evaluated
+- Geometric mean compression vs JSON-LD: 79.8%
+- Smallest CBOR-LD-ex message: 55 bytes (minimal_temperature/t1-8bit)
+- Bit efficiency: 75.7%–96.8% depending on precision mode
+- Tier 1 8-bit: 93.0% bit efficiency
+- Tier 2 8-bit: 95.5% bit efficiency
+
+### Artifacts
+- Output: demo/output/benchmark.{md,csv,tex}
+- Code: benchmarks/cbor_ld_ex_benchmark/__init__.py
+- Tests: tests/test_benchmark.py (scenario, metric, invariant, formatting sections)
+
+---
+
+## EXP-002: SL Quantization Correctness + Bit-Efficiency
+
+**Date:** pre-2026-05-30
+**Researcher:** Muntaser Syed
+**Type:** computational
+**Status:** completed
+
+### Hypothesis
+Constrained binomial quantization (Definition 10) preserves the simplex
+constraint b̂ + d̂ + û = 2^n - 1 exactly (Theorem 1) at all precisions,
+and the symmetric clamping rule eliminates belief bias.
+
+### Results
+- 968 tests passing (zero failures) covering:
+  - Binomial quantization round-trip at 8/16/32-bit
+  - Multinomial quantization constraint preservation (Theorem 3)
+  - Symmetric clamping tiebreaker (â LSB rule)
+  - Delta mode (DELTA_8) encode/decode
+  - _validate_bits() enforcement (b ∈ {2..8})
+  - _NORM_MAX_LOOKUP: 15 Rust-canonical hex-pinned float32 values
+  - Wire format self-description via seed MSB mode flag
+
+### Artifacts
+- Code: src/cbor_ld_ex/opinions.py, headers.py, annotations.py, codec.py
+- Tests: tests/test_opinions.py, test_headers.py, test_annotations.py,
+  test_codec.py, test_axioms.py
+
+---
+
+## EXP-003: Batch Compression RD + Ablation
+
+**Date:** pre-2026-05-30
+**Researcher:** Muntaser Syed
+**Type:** computational
+**Status:** completed
+
+### Hypothesis
+Batch opinion encoding via RHT (Random Hadamard Transform) + Lloyd-Max
+quantization achieves better compression than individual per-opinion
+encoding at equal or better distortion.
+
+### Results
+- **Honest negative finding (enshrined):** Independent per-component
+  quantization beats RHT + Lloyd-Max on MSE at equal bit-width.
+  RHT's value is compression (fewer wire bits via coordinated encoding),
+  NOT distortion improvement.
+- ρ ≈ 4.2 (spec §11.7 reports honestly)
+- Lloyd-Max MSE < uniform MSE at all bit-widths (validated)
+- Shannon R-D bound D_G(b) < all achieved codebook MSE (validated)
+- ρ increases with bits (approaching asymptote)
+
+### Artifacts
+- Code: src/cbor_ld_ex/batch.py (~40KB)
+- Tests: tests/test_batch.py (batch compression, distortion, ablation,
+  constraint, RD curve sections)
+- Benchmark: benchmarks/cbor_ld_ex_benchmark/__init__.py
+  (run_batch_compression_analysis, run_batch_distortion_analysis,
+   run_batch_ablation_analysis, run_batch_constraint_analysis,
+   run_batch_rd_curve)
+
+---
+
+## EXP-004: Provenance/Integrity Overhead
+
+**Date:** pre-2026-05-30
+**Researcher:** Muntaser Syed
+**Type:** computational
+**Status:** completed
+
+### Hypothesis
+Provenance chain encoding in CBOR-LD-ex adds bounded overhead per chain
+entry, and integrity verification (CRC-8 digest) is correct.
+
+### Results
+- Provenance entry: fixed PROVENANCE_ENTRY_SIZE bytes per entry
+- Audit entry: fixed AUDIT_ENTRY_SIZE bytes per entry
+- Chain integrity verified via compute_entry_digest
+- Benchmark: run_provenance_analysis in benchmark module
+
+### Artifacts
+- Code: src/cbor_ld_ex/security.py (~17KB)
+- Tests: tests/test_security.py
+- Benchmark: benchmarks/cbor_ld_ex_benchmark/__init__.py
+  (build_provenance_configs, run_provenance_analysis)
+
+---
+
+## EXP-005: Tier 1→2→3 Simulation Pipeline
+
+**Date:** pre-2026-05-30
+**Researcher:** Muntaser Syed
+**Type:** computational
+**Status:** completed
+
+### Hypothesis
+The full CBOR-LD-ex pipeline (constrained sensors → edge gateway → cloud)
+preserves opinion validity, quantization constraints, and provenance
+integrity across all tiers, with deterministic results via fixed seed.
+
+### Results
+- Pipeline: N sensors → temporal decay → Byzantine filter → cumulative
+  fusion → provenance chain → audit summary
+- One deliberate outlier sensor successfully filtered
+- All encoding/decoding hops verified via real CBOR-LD-ex codec
+- MQTT and CoAP transport adapters produce identical payloads
+- Deterministic via seed — identical results on every run
+
+### Artifacts
+- Code: benchmarks/cbor_ld_ex_benchmark/simulation.py (~20KB)
+- Tests: tests/test_simulation.py (6 sections: sensor gen, gateway,
+  cloud, end-to-end, transport, scientific invariants)
+
+---
+
+## EXP-006: Wire-Size Experiment (9 Formats × 4 Real Datasets)
 
 **Date:** 2026-05-30
 **Researcher:** Muntaser Syed
@@ -11,47 +166,45 @@
 
 ### Hypothesis
 CBOR-LD-ex produces the smallest wire representation among self-describing
-formats for real IoT sensor records, due to context compression (integer keys)
-and bit-packed annotation encoding.
+formats for real IoT sensor records, due to context compression (integer
+keys) and bit-packed annotation encoding.
 
 ### Independent Variables
 - Encoding format: JSON-LD, jsonld-ex CBOR-LD, CBOR-LD, CBOR-LD-ex,
   SenML/JSON, SenML/CBOR, Protobuf, FlatBuffers, MessagePack
-- Dataset: Intel Lab, UCI Air Quality, CIC-IoT-2023, SWaT A8
+- Dataset: Intel Lab (10K sample of 2.3M), UCI Air Quality (827 clean),
+  CIC-IoT-2023 (10K sample of 712K), SWaT A8 (10K sample)
 
 ### Dependent Variables / Metrics
-- Wire size (bytes) per record per format
+- Wire size (bytes) per record per format (mean ± std)
 - Compression ratio vs JSON-LD baseline (geometric mean)
 - Frame-fit percentage per MTU threshold
 
 ### Control Conditions
 - Same record content encoded in all formats
-- Same annotation (Tier 1, COMPLIANT, 8-bit opinion) across JSON-LD family
-- Non-canonical cbor2 serialization for fair CBOR-LD vs CBOR-LD-ex comparison
+- Same annotation (Tier 1, COMPLIANT, 8-bit) across JSON-LD family
+- Non-canonical cbor2 serialization for fair comparison
 
 ### Results
-- Compression ratio vs JSON-LD: 0.242 (Intel Lab), 0.324 (UCI AQ),
-  0.486 (CIC-IoT), 0.572 (SWaT A8)
-- Frame-fit 802.15.4 (127B): CBOR-LD-ex 100% on Intel Lab, 0% for all
-  other self-describing formats
-- Full tables: papers/cborld-ex-main/tables/wire_sizes.{md,csv}
+- Compression ratio vs JSON-LD:
+  Intel Lab: 0.242, UCI AQ: 0.324, CIC-IoT: 0.486, SWaT: 0.572
+- Frame-fit 802.15.4 (127B): CBOR-LD-ex 100% on Intel Lab, 0% all others
+- Protobuf smallest overall: 0.179 (Intel Lab) — no on-wire semantics
 
 ### Observations
-- jsonld-ex CBOR-LD is NOT always smaller than JSON-LD. CBOR float64 (9B)
-  exceeds JSON's "0.0" (3B) on flag-heavy datasets (CIC-IoT, SWaT).
-- SenML/JSON is larger than JSON-LD for many-field datasets — per-measurement
-  record overhead (repeated "n", "v", "u" keys) dominates.
-- canonical=True in cbor2 gave CBOR-LD unfair advantage via float16 encoding;
-  fixed to non-canonical for fair comparison.
+- jsonld-ex CBOR-LD NOT always < JSON-LD: CBOR float64 > JSON "0.0"
+- SenML/JSON > JSON-LD for many-field datasets (per-record overhead)
+- canonical=True gave CBOR-LD unfair advantage; fixed to non-canonical
 
 ### Artifacts
 - Script: benchmarks/run_wire_size_experiment.py
 - Output: papers/cborld-ex-main/tables/wire_sizes.{md,csv}
-- Tests: tests/test_real_data.py (1175 tests including harness + runner)
+- Harness: benchmarks/cbor_ld_ex_benchmark/real_data.py
+- Tests: tests/test_real_data.py (1175 tests)
 
 ---
 
-## EXP-001: Software Decode Throughput (9 formats × 4 datasets)
+## EXP-007: Software Decode Throughput (9 Formats × 4 Datasets)
 
 **Date:** 2026-05-30
 **Researcher:** Muntaser Syed
@@ -60,9 +213,8 @@ and bit-packed annotation encoding.
 
 ### Hypothesis
 CBOR-LD-ex decode throughput is competitive with other CBOR-based formats
-despite the additional annotation decoding step. JSON-LD (text parsing) is
-the slowest. Protobuf is the fastest (minimal parsing overhead). CBOR-based
-formats (CBOR-LD, CBOR-LD-ex, SenML/CBOR) form a middle tier.
+despite the additional annotation decoding step. JSON-LD (text parsing)
+is the slowest. Protobuf is the fastest (minimal parsing overhead).
 
 ### Independent Variables
 - Encoding format (9 formats)
@@ -73,35 +225,27 @@ formats (CBOR-LD, CBOR-LD-ex, SenML/CBOR) form a middle tier.
 - Decode latency: microseconds/record
 
 ### Control Conditions
-- Same pre-encoded wire bytes (encode once, decode N times)
-- Same hardware (user's laptop: 64GB RAM, 4090 GPU — CPU-bound test)
-- Same Python interpreter (poetry run)
+- Pre-encoded wire bytes (encode once, decode N times)
+- Same hardware, same Python interpreter
 - Warmup iterations excluded from measurement
 - timeit with sufficient repetitions for stable measurement
 
 ### Protocol
 1. For each dataset, take 100 representative records
 2. Pre-encode each record in all 9 formats (store wire bytes)
-3. For each format: timeit decode of all 100 records × 100 iterations
+3. For each format: timeit decode of 100 records × 100 iterations
 4. Compute mean ± std decode time per record
 5. Report as records/second and μs/record
-
-### Environment
-- Hardware: Windows laptop, 64GB RAM, RTX 4090 (CPU-bound)
-- Software: Python 3.x, Poetry, cbor2, jsonld-ex
-- Git commit: [to be filled]
-- Config: inline in script (no separate config file)
 
 ### Results
 [To be filled after execution]
 
 ### Artifacts
 - Script: benchmarks/run_decode_throughput.py
-- Output: papers/cborld-ex-main/tables/decode_throughput.{md,csv}
 
 ---
 
-## EXP-002: Temporal/Delta Streaming Overhead (Intel Lab)
+## EXP-008: Temporal/Delta Streaming Overhead (Intel Lab)
 
 **Date:** 2026-05-30
 **Researcher:** Muntaser Syed
@@ -109,11 +253,10 @@ formats (CBOR-LD, CBOR-LD-ex, SenML/CBOR) form a middle tier.
 **Status:** planned
 
 ### Hypothesis
-CBOR-LD-ex delta mode (PrecisionMode.DELTA_8) reduces per-reading wire cost
-for successive readings from the same sensor, because only the opinion delta
-(2 bytes) is transmitted instead of the full opinion (3 bytes). Over a stream
-of N readings from the same mote at 31-second cadence, cumulative savings are
-proportional to N.
+CBOR-LD-ex delta mode (PrecisionMode.DELTA_8) reduces per-reading wire
+cost for successive readings from the same sensor. Over N readings from
+the same mote at 31-second cadence, cumulative savings are proportional
+to N.
 
 ### Independent Variables
 - Encoding mode: full opinion (BITS_8) vs delta (DELTA_8)
@@ -122,27 +265,20 @@ proportional to N.
 ### Dependent Variables / Metrics
 - Per-reading wire size (bytes) in full vs delta mode
 - Cumulative wire savings over N readings
-- Overhead of first full reading (baseline cost)
-
-### Control Conditions
-- Same mote, consecutive timestamps (Intel Lab, 31s cadence)
-- Same context registry and data fields
-- Delta is opinion-only; data fields always fully encoded
 
 ### Protocol
-1. Load Intel Lab data, filter to a single mote (e.g., moteid=1)
-2. Sort by epoch, take first 100 consecutive readings
-3. Encode reading 1 with full Tier 1 annotation (BITS_8)
+1. Load Intel Lab data, filter to moteid=1, sort by epoch
+2. Take first 100 consecutive readings
+3. Encode reading 1 with full annotation (BITS_8)
 4. Encode readings 2–100 with delta annotation (DELTA_8)
 5. Compare total wire cost: all-full vs first-full + rest-delta
-6. Report per-reading savings and cumulative savings
 
 ### Results
 [To be filled after execution]
 
 ---
 
-## EXP-003: End-to-End Tier 1→2→3 Simulation
+## EXP-009: End-to-End Tier 1→2→3 on Real Data
 
 **Date:** 2026-05-30
 **Researcher:** Muntaser Syed
@@ -150,33 +286,25 @@ proportional to N.
 **Status:** planned
 
 ### Hypothesis
-The CBOR-LD-ex tiered architecture (constrained→edge→cloud) produces
-increasing wire sizes at each tier due to richer headers and metadata,
-but each tier's encoding remains more compact than the equivalent
-JSON-LD representation at that tier.
+The CBOR-LD-ex tiered architecture produces increasing wire sizes at
+each tier (richer headers/metadata), but each tier's encoding remains
+more compact than the equivalent JSON-LD representation.
 
 ### Independent Variables
-- Tier level: Tier 1 (constrained, 1B header), Tier 2 (edge, 4B header),
-  Tier 3 (cloud, 4B + extensions)
-- Dataset: Intel Lab (representative constrained-device scenario)
+- Tier level: Tier 1 (1B header), Tier 2 (4B header), Tier 3 (4B + ext)
+- Dataset: Intel Lab slice
 
 ### Dependent Variables / Metrics
 - Wire size per tier
 - Header overhead per tier
 - Compression ratio vs JSON-LD equivalent at each tier
 
-### Control Conditions
-- Same sensor data at all tiers
-- Tier 2 adds: operator_id, reasoning_context, source_count
-- Tier 3 adds: provenance chain, extended context
-
 ### Protocol
 1. Take 100 Intel Lab records
 2. Encode each at Tier 1 (constrained device reading)
-3. Simulate edge aggregation: Tier 2 header with cumulative fusion operator
-4. Simulate cloud ingest: Tier 3 header with provenance chain
-5. Compare wire sizes across tiers
-6. Compare each tier vs JSON-LD equivalent
+3. Simulate edge: Tier 2 header with cumulative fusion operator
+4. Simulate cloud: Tier 3 header with provenance chain
+5. Compare wire sizes across tiers and vs JSON-LD
 
 ### Results
 [To be filled after execution]
