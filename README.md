@@ -275,7 +275,8 @@ cborldex/
 │   └── test_transport.py     # 24 tests — MQTT, CoAP, 6-way benchmark
 ├── spec/
 │   ├── FORMAL_MODEL.md       # Formal specification v0.4.6-draft
-│   └── IMPLEMENTATION_PLAN.md
+│   ├── rust-reference/       # Rust cross-reference stubs
+│   └── archive/              # Superseded spec drafts
 ├── benchmarks/
 │   └── cbor_ld_ex_benchmark/ # Publication benchmark & simulation framework
 ├── pyproject.toml

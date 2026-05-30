@@ -1,7 +1,7 @@
 """
 Security primitives for CBOR-LD-ex.
 
-Implements SECTION9_SECURITY.md and FORMAL_MODEL.md §9:
+Implements FORMAL_MODEL.md §9:
   - Annotation digest: truncate(SHA-256(annotation_bytes), 64 bits)
   - Byzantine fusion metadata: bit-packed (4 bytes)
   - Provenance chain entries: bit-packed (16 bytes each)

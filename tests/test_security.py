@@ -1,7 +1,7 @@
 """
 Phase 5 tests: Security primitives for CBOR-LD-ex.
 
-Tests are derived from SECTION9_SECURITY.md and FORMAL_MODEL.md §9:
+Tests are derived from FORMAL_MODEL.md §9:
   - Annotation digest: truncated SHA-256 (64 bits / 8 bytes)
   - Byzantine fusion metadata: bit-packed (4 bytes)
   - Provenance chain entries: bit-packed (16 bytes each), chained digests

@@ -1,7 +1,7 @@
 """
 Phase 4 tests: Temporal extensions for CBOR-LD-ex.
 
-Tests are derived from SECTION7_TEMPORAL.md and FORMAL_MODEL.md §7:
+Tests are derived from FORMAL_MODEL.md §7:
   - Bit-packed extension block (has_temporal, has_triggers flags)
   - Half-life log-scale encoding (8 bits, 25 orders of magnitude base-2)
   - Quantized decay (dequantize → decay → re-quantize, Axiom 3 preserved)

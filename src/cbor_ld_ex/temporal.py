@@ -1,7 +1,7 @@
 """
 Temporal extensions for CBOR-LD-ex.
 
-Implements SECTION7_TEMPORAL.md:
+Implements FORMAL_MODEL.md §7:
   - Bit-packed extension block (has_temporal, has_triggers)
   - Log-scale half-life encoding (8 bits, ~1 second to ~388 days)
   - Three decay functions matching jsonld-ex (exponential, linear, step)
